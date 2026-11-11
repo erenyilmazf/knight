@@ -269,12 +269,11 @@ class API:
             raise APIError("Token-count endpoint returned no valid input_tokens")
         return value
 
-    def generate(self, body, on_event):
+    def generate(self, body):
         """Read the complete response, including its opaque reasoning items."""
         with self.open("/responses", dict(body, stream=True)) as response:
             if "text/event-stream" not in response.headers.get("Content-Type", ""):
                 result = json.load(response)
-                on_event({"type": "response." + result.get("status", "failed"), "response": result})
                 return result
             parts = []
             for raw in response:
@@ -286,7 +285,6 @@ class API:
                     if data == "[DONE]":
                         continue
                     event = json.loads(data)
-                    on_event(event)
                     if event.get("type") in {"response.completed", "response.incomplete", "response.failed"}:
                         return event["response"]
                     if event.get("type") == "error":
@@ -712,10 +710,6 @@ def context_group_deltas(groups, cache_mode, memories=(), off_groups=(), recentl
             if group['id'] in hidden:
                 deltas[index] += difference
     return deltas
-
-
-def group_input_delta_bytes(group, cache_mode):
-    return context_group_deltas([group], cache_mode)[0]
 
 
 def group_preview(group, limit=110):
@@ -3431,7 +3425,7 @@ class App:
                 except BaseException:
                     s.state = previous
                     raise
-            final = self.api.generate(body, lambda event: None)
+            final = self.api.generate(body)
             with s.state_lock:
                 received_at = now()
                 if s.state.get("last_interaction_at") == input_at:
