@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 Eren Yilmaz
 """Record one clip, or transcribe an existing file: python3 tools/voice.py [audio]."""
 import argparse
 import getpass

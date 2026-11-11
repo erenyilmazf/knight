@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 Eren Yilmaz
 """Shared local message wire. No server, API call, task allocation, or waking.
 
   python3 wire.py read

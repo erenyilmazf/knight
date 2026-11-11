@@ -21,6 +21,8 @@ Requires Linux, Python 3.10+ with `venv`/`pip`, Bash, Git and access to the
 OpenAI Responses API. Run these commands from this checkout in Bash.
 
 ```bash
+git clone https://github.com/erenyilmazf/knight.git
+cd knight
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
@@ -108,5 +110,8 @@ companion releases.
 
 ## Licence
 
-Licence selection pending Eren’s approval before publication. Proposed:
-GPL-3.0, matching his existing public code repositories.
+Copyright © 2026 Eren Yilmaz.
+
+Licensed under the [GNU General Public License v3.0](LICENSE)
+(`GPL-3.0-only`). You may use, study, modify and redistribute Knight under
+that licence. Distributed without warranty.

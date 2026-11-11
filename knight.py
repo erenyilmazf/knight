@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-only
+# Copyright (C) 2026 Eren Yilmaz
 """Saved text and Bash pulses. Linux, Python 3.10+.
 Easy commands: prompt_toolkit. Optional context windows: PyQt6.
 
