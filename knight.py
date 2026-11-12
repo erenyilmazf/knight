@@ -3255,7 +3255,7 @@ class App:
             cwd_file = Path(temp) / "cwd"
             environment = {k: v for k, v in os.environ.items() if not k.startswith("OPENAI_")}
             environment["CWD_FILE"] = str(cwd_file)
-            script = "trap 'pwd -P > \"$CWD_FILE\"' EXIT\n" + script
+            script = "trap '{ pwd -P > \"$CWD_FILE\"; } 2>/dev/null' EXIT\n" + script
             process = subprocess.Popen(
                 ["bash", "-c", script], cwd=s.state["cwd"], stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -3277,7 +3277,11 @@ class App:
                 code = 130 if interrupted else 124
             finally:
                 if cwd_file.exists():
-                    saved = cwd_file.read_text(encoding="utf-8").removesuffix("\n")
+                    try:
+                        saved = cwd_file.read_bytes().decode("utf-8").removesuffix("\n")
+                    except UnicodeDecodeError:
+                        saved = ""
+                        print("[cwd unchanged: directory name is not UTF-8.]", flush=True)
                     if saved and Path(saved).is_dir():
                         with s.state_lock:
                             s.state["cwd"] = saved

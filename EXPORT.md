@@ -2,7 +2,7 @@
 
 Prepared from the running InventionLab code on 11 November 2026.
 
-Current `knight.py` SHA-256: `c70016bf0e6cebbcd34a03bb3374e9c666709d9455c6b1233fe3e1efa06fda44`
+Current `knight.py` SHA-256: `4ffe08bb33ab9113e4c3f0c7d78c7a0bf90f98a5c42a24f5c4c0022e2df27081`
 
 Export adjustments: checkout-relative Wire/voice helper paths, a shared
 `KNIGHT_HOME` data directory, automatic Git pushes off by default, and the
@@ -29,3 +29,7 @@ Execution, memory controls and export adjustments are unchanged.
 The HUD defines an action and omits the lifetime API number. Exact captures
 match saved replies through local request hashes; old API-number captures work.
 Directory carry-over uses an EXIT trap; exec or replacing the trap bypasses it.
+
+Directory capture preserves CR/LF bytes and suppresses its own xtrace output.
+An undecodable directory name leaves cwd unchanged and prints a warning; the
+command result is retained.
