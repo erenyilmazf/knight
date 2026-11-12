@@ -27,6 +27,7 @@ import stat
 import struct
 import threading
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import re
 import shlex
 import shutil
@@ -55,13 +56,13 @@ DEFAULTS = {
 
 # Edit these fields to change the HUD; mode execution is enforced separately.
 HUD_TEMPLATE = """================ STATUS ================
+An action is a Bash command.
 agent_id:{agent_id}
 mode:{mode}
 response:{response}
 A_OBSERVE := {{a | a is a read-only Bash command}}
 A_ACT := {{a | a is a state-changing Bash command}}
 task:{task}
-api_call_number:{api_call_number}
 action_number:{action_number}
 actions_remaining_after_this:{actions_remaining_after_this}
 effort:{effort}
@@ -1826,7 +1827,7 @@ def make_request_window(owner, parent=None, path=None):
                 ident, call, stamp = self.capture_identity(items)
                 form = f"list ({len(items):,} items)" if isinstance(body['input'], list) else 'string (one whole value)'
                 self.compare_labels[side].setText(
-                    f"{('EARLIER', 'LATER')[side]} · session {ident or 'unknown'} · API {call if call is not None else '?'}\n"
+                    f"{('EARLIER', 'LATER')[side]} · session {ident or 'unknown'}" + (f" · API {call}" if call is not None else "") + "\n"
                     f"{path}\n{form} · {self.input_range(body, start, end)}")
                 self.compare_labels[side].setToolTip(f"Input prepared at: {stamp or 'unknown'}")
                 selected = {f'input[{index}]': items[index] for index in range(start, end)}
@@ -1880,9 +1881,9 @@ def make_request_window(owner, parent=None, path=None):
                 text = self.readable(item)
                 ident = re.search(r'^agent_id:\s*(\S+)\s*$', text, re.M)
                 call = re.search(r'^api_call_number:\s*(\d+)\s*$', text, re.M)
-                if ident and call:
+                if ident:
                     stamp = re.search(r'^(?:input_prepared_at|time):\s*(.+)$', text, re.M)
-                    return ident.group(1), int(call.group(1)), stamp.group(1).strip() if stamp else '?'
+                    return ident.group(1), int(call.group(1)) if call else None, stamp.group(1).strip() if stamp else '?'
             return None, None, None
 
         def load_capture(self, path=None):
@@ -1907,7 +1908,9 @@ def make_request_window(owner, parent=None, path=None):
                 self.copy_button.setEnabled(True)
                 ident, call, stamp = self.capture_identity()
                 input_kind = f"list, {len(inputs):,} items" if isinstance(inputs, list) else 'string'
-                identity = f"Agent {ident} · API {call} · input prepared {stamp}" if ident else 'No console identity/call found in this capture'
+                identity = f"Agent {ident} · input prepared {stamp}" if ident else 'No console identity found in this capture'
+                if call is not None:
+                    identity += f" · API {call}"
                 self.summary.setText(f"{identity}\ninput: {input_kind} · {len(raw):,} exact request bytes\n"
                     f"SHA256 {hashlib.sha256(raw).hexdigest()}\nCaptured before submission; this file alone does not establish server receipt.")
                 self.preview_texts = []
@@ -1950,17 +1953,21 @@ def make_request_window(owner, parent=None, path=None):
 
         def show_reply(self, ident, call):
             state = owner.session.state
-            if ident is None or call is None:
-                self.reply_text.setPlainText('No matching call identity in the captured HUD. Saved replies were not guessed.')
+            if ident is None:
+                self.reply_text.setPlainText('No session identity in the captured HUD.')
                 return
             if ident != state['id']:
                 self.reply_text.setPlainText(f"This is agent {ident}'s request. The open session is {state['id']}; its replies were not substituted.")
                 return
-            matches = [g for g in state['groups'] if g.get('kind') == 'request' and g.get('call') == call]
+            digest = hashlib.sha256(self.raw).hexdigest()
+            matches = [g for g in state['groups'] if g.get('kind') == 'request' and
+                       (g.get('request_sha256') == digest or
+                        (call is not None and not g.get('request_sha256') and g.get('call') == call))]
             if len(matches) != 1:
-                self.reply_text.setPlainText('No unique saved response for this call in the open session. It may be unfinished or deleted; the capture remains readable.')
+                self.reply_text.setPlainText('No unique saved response for this captured request in the open session. It may be unfinished or deleted; the capture remains readable.')
                 return
             group = matches[0]
+            call = group.get('call', '?')
             self.reply_label.setText(f"Saved response · API {call} · group {group['id']}\n"
                 f"{group.get('received_at', group.get('time', '?'))} · {group.get('status', 'status unknown')}")
             lines = ['From the open session record; not part of the captured input.']
@@ -3198,7 +3205,6 @@ class App:
             agent_id=s.state["id"], mode="text" if mode == "CHAT" else mode.lower(),
             response="text" if mode == "CHAT" else "bash tool or text",
             task="reply" if mode == "CHAT" else "execute a ∈ A_OBSERVE ∪ A_ACT",
-            api_call_number=s.state["calls"] + 1,
             action_number="-" if mode == "CHAT" else f"{self.pulse_total - remaining + 1}/{self.pulse_total}",
             actions_remaining_after_this=0 if mode == "CHAT" else remaining - 1,
             effort=s.config["effort"],
@@ -3245,25 +3251,37 @@ class App:
         s, c = self.session, self.session.config
         print(terminal_style("38;2;180;190;240") + "\n$ " + script + terminal_style("0"), flush=True)
         started = time.monotonic()
-        process = subprocess.Popen(
-            ["bash", "-c", script], cwd=s.state["cwd"], stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            env={k: v for k, v in os.environ.items() if not k.startswith("OPENAI_")},
-            start_new_session=True,
-        )
-        interrupted = timed_out = False
-        try:
-            raw, _ = process.communicate(timeout=c["bash_timeout"])
-            code = process.returncode
-        except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
-            interrupted = isinstance(error, KeyboardInterrupt)
-            timed_out = not interrupted
+        with TemporaryDirectory() as temp:
+            cwd_file = Path(temp) / "cwd"
+            environment = {k: v for k, v in os.environ.items() if not k.startswith("OPENAI_")}
+            environment["CWD_FILE"] = str(cwd_file)
+            script = "trap 'pwd -P > \"$CWD_FILE\"' EXIT\n" + script
+            process = subprocess.Popen(
+                ["bash", "-c", script], cwd=s.state["cwd"], stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                env=environment,
+                start_new_session=True,
+            )
+            interrupted = timed_out = False
             try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            raw, _ = process.communicate()
-            code = 130 if interrupted else 124
+                raw, _ = process.communicate(timeout=c["bash_timeout"])
+                code = process.returncode
+            except (subprocess.TimeoutExpired, KeyboardInterrupt) as error:
+                interrupted = isinstance(error, KeyboardInterrupt)
+                timed_out = not interrupted
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                raw, _ = process.communicate()
+                code = 130 if interrupted else 124
+            finally:
+                if cwd_file.exists():
+                    saved = cwd_file.read_text(encoding="utf-8").removesuffix("\n")
+                    if saved and Path(saved).is_dir():
+                        with s.state_lock:
+                            s.state["cwd"] = saved
+                            s.save()
         # Keep large/image-bearing output in this same session file, not extra logs.
         projected = re.sub(
             rb"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/]+={0,2}",
@@ -3411,6 +3429,7 @@ class App:
                 number = s.state["calls"]
                 group.update(call=number, mode=mode, model=c["model"], effort=c["effort"], input_counted=counted,
                              requested_service_tier=body["service_tier"])
+                group["request_sha256"] = hashlib.sha256(payload_bytes(dict(body, stream=True))).hexdigest()
                 s.state["pending"] = {"stage": "api", "group": group["id"]}
                 s.save()
             print(terminal_style("94") + f"\n[{s.state['id']} api {number}; {'text' if mode == 'CHAT' else mode.lower()}; {c['model']}; {c['effort']}]" + terminal_style("0"), flush=True)

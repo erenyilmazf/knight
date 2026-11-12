@@ -2,7 +2,7 @@
 
 Prepared from the running InventionLab code on 11 November 2026.
 
-Current `knight.py` SHA-256: `4d6ff6ed7ed049d18be756d39ccbfa2dc387646a9490f00449b624ed47e72260`
+Current `knight.py` SHA-256: `c70016bf0e6cebbcd34a03bb3374e9c666709d9455c6b1233fe3e1efa06fda44`
 
 Export adjustments: checkout-relative Wire/voice helper paths, a shared
 `KNIGHT_HOME` data directory, automatic Git pushes off by default, and the
@@ -24,3 +24,8 @@ callback. Request bytes, response parsing and export adjustments are unchanged.
 13 November: show Bash-opportunity counters and request effort; label input
 preparation and response receipt times. Old HUDs and captures remain readable.
 Execution, memory controls and export adjustments are unchanged.
+
+13 November: ordinary Bash cd carries into the next command and session save.
+The HUD defines an action and omits the lifetime API number. Exact captures
+match saved replies through local request hashes; old API-number captures work.
+Directory carry-over uses an EXIT trap; exec or replacing the trap bypasses it.
