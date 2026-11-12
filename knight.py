@@ -58,13 +58,16 @@ HUD_TEMPLATE = """================ STATUS ================
 agent_id:{agent_id}
 mode:{mode}
 response:{response}
+A_OBSERVE := {{a | a is a read-only Bash command}}
+A_ACT := {{a | a is a state-changing Bash command}}
 task:{task}
 api_call_number:{api_call_number}
-pulse_call:{pulse_call}
-api_calls_remaining_after_this:{api_calls_remaining_after_this}
+action_number:{action_number}
+actions_remaining_after_this:{actions_remaining_after_this}
+effort:{effort}
 cwd:{cwd}
 session:{session}
-time:{timestamp}
+input_prepared_at:{timestamp}
 ========================================"""
 BASH_TOOL = {
     "type": "function", "name": "bash",
@@ -332,13 +335,10 @@ def historical_hud(group):
     parts = [line.partition(":") for line in lines[1:-1]]
     if tuple(p[0] for p in parts) != HUD_FIELDS or any(p[1] != ":" for p in parts):
         return None
-    fields = {key: value for key, _, value in parts}
-    try:
-        if HUD_TEMPLATE.format(**fields, timestamp=fields["time"]) != text:
-            return None
-    except (KeyError, ValueError):
+    if (lines[0] != "================ STATUS ================"
+            or lines[-1] != "========================================"):
         return None
-    return fields
+    return {key: value for key, _, value in parts}
 
 
 # CONTEXT_RETENTION_V2: completed reasoning persists; historical HUDs do not.
@@ -457,7 +457,7 @@ def response_gap_text(state, stamp=None):
     """Wall-clock response-to-request interval, not a claim about human absence."""
     previous = response_datetime(state.get("last_response_at"))
     current = response_datetime(stamp if stamp is not None else now())
-    prefix = "Time since previous API response: "
+    prefix = "Time since previous response received: "
     if previous is None or current is None:
         return prefix + "unknown."
     seconds = (current - previous).total_seconds()
@@ -954,7 +954,7 @@ def group_items(group):
     items = group["items"]
     if group.get("kind") == "request" and response_datetime(group.get("received_at")) is not None:
         index = 1 if historical_hud(group) is not None else 0
-        items = items[:index] + [input_message(f"[Response {group['received_at']}]", "developer")] + items[index:]
+        items = items[:index] + [input_message(f"[Response received {group['received_at']}]", "developer")] + items[index:]
     notice = manual_edit_notice(group)
     if notice:
         index = 1 if historical_hud(group) is not None else 0
@@ -1828,7 +1828,7 @@ def make_request_window(owner, parent=None, path=None):
                 self.compare_labels[side].setText(
                     f"{('EARLIER', 'LATER')[side]} · session {ident or 'unknown'} · API {call if call is not None else '?'}\n"
                     f"{path}\n{form} · {self.input_range(body, start, end)}")
-                self.compare_labels[side].setToolTip(f"Captured HUD time: {stamp or 'unknown'}")
+                self.compare_labels[side].setToolTip(f"Input prepared at: {stamp or 'unknown'}")
                 selected = {f'input[{index}]': items[index] for index in range(start, end)}
                 if isinstance(body['input'], str):
                     selected = {'input (whole string)': items[0]} if end > start else {}
@@ -1881,7 +1881,7 @@ def make_request_window(owner, parent=None, path=None):
                 ident = re.search(r'^agent_id:\s*(\S+)\s*$', text, re.M)
                 call = re.search(r'^api_call_number:\s*(\d+)\s*$', text, re.M)
                 if ident and call:
-                    stamp = re.search(r'^time:\s*(.+)$', text, re.M)
+                    stamp = re.search(r'^(?:input_prepared_at|time):\s*(.+)$', text, re.M)
                     return ident.group(1), int(call.group(1)), stamp.group(1).strip() if stamp else '?'
             return None, None, None
 
@@ -1907,7 +1907,7 @@ def make_request_window(owner, parent=None, path=None):
                 self.copy_button.setEnabled(True)
                 ident, call, stamp = self.capture_identity()
                 input_kind = f"list, {len(inputs):,} items" if isinstance(inputs, list) else 'string'
-                identity = f"Agent {ident} · API {call} · HUD time {stamp}" if ident else 'No console identity/call found in this capture'
+                identity = f"Agent {ident} · API {call} · input prepared {stamp}" if ident else 'No console identity/call found in this capture'
                 self.summary.setText(f"{identity}\ninput: {input_kind} · {len(raw):,} exact request bytes\n"
                     f"SHA256 {hashlib.sha256(raw).hexdigest()}\nCaptured before submission; this file alone does not establish server receipt.")
                 self.preview_texts = []
@@ -3192,24 +3192,26 @@ class App:
         self.pause = True
         print("\nPause requested; Ctrl-C again interrupts the current operation.", flush=True)
 
-    def control(self, mode, remaining):
+    def control(self, mode, remaining, stamp=None):
         s = self.session
         return input_message(HUD_TEMPLATE.format(
             agent_id=s.state["id"], mode="text" if mode == "CHAT" else mode.lower(),
             response="text" if mode == "CHAT" else "bash tool or text",
-            task="reply" if mode == "CHAT" else "observe|act",
+            task="reply" if mode == "CHAT" else "execute a ∈ A_OBSERVE ∪ A_ACT",
             api_call_number=s.state["calls"] + 1,
-            pulse_call="-" if mode == "CHAT" else f"{self.pulse_total - remaining + 1}/{self.pulse_total}",
-            api_calls_remaining_after_this=0 if mode == "CHAT" else remaining - 1,
-            cwd=s.state["cwd"], session=str(s.path), timestamp=now(),
+            action_number="-" if mode == "CHAT" else f"{self.pulse_total - remaining + 1}/{self.pulse_total}",
+            actions_remaining_after_this=0 if mode == "CHAT" else remaining - 1,
+            effort=s.config["effort"],
+            cwd=s.state["cwd"], session=str(s.path), timestamp=stamp or now(),
         ) + "\nTo view an image, make Bash output only its absolute PNG, JPEG or WebP path. Images appear for one completed response; saved copies remain.", "developer")
 
     @with_state_lock
     def body(self, mode="CHAT", remaining=1):
         c = self.session.config
-        history = self.session.context() + interaction_gap_items(self.session.state) + [
-            input_message(response_gap_text(self.session.state), "developer")
-        ] + input_shape_items(self.session.state) + [self.control(mode, remaining)]
+        history = self.session.context() + interaction_gap_items(self.session.state)
+        stamp = now()
+        history += [input_message(response_gap_text(self.session.state, stamp), "developer")
+        ] + input_shape_items(self.session.state) + [self.control(mode, remaining, stamp)]
         history = context_input_items(history + recently_off_items(self.session.state), c["cache_mode"])
         return {
             "model": c["model"], "input": history, "tools": [BASH_TOOL],
