@@ -2,7 +2,7 @@
 
 Prepared from the running InventionLab code on 11 November 2026.
 
-Current `knight.py` SHA-256: `4ffe08bb33ab9113e4c3f0c7d78c7a0bf90f98a5c42a24f5c4c0022e2df27081`
+Current `knight.py` SHA-256: `7d1fd99dea6be59559e385d47ea3ad3dde0d2d82f5de8fe0bc6cf36c87832e69`
 
 Export adjustments: checkout-relative Wire/voice helper paths, a shared
 `KNIGHT_HOME` data directory, automatic Git pushes off by default, and the
@@ -33,3 +33,9 @@ Directory carry-over uses an EXIT trap; exec or replacing the trap bypasses it.
 Directory capture preserves CR/LF bytes and suppresses its own xtrace output.
 An undecodable directory name leaves cwd unchanged and prints a warning; the
 command result is retained.
+
+13 November purge: named collections replaced by independent star marks; old
+record conversion removed from ordinary reads/saves. Removed the extra composer,
+slash-command parser and captured-request comparison window. F6 opens context,
+F7 loads files, and F8 switches between text and actual Python (app/session).
+Existing F2/F3/F4/F5 controls, time cues and selection-size measurements remain.

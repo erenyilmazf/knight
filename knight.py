@@ -29,7 +29,6 @@ import threading
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import re
-import shlex
 import shutil
 import signal
 import subprocess
@@ -309,40 +308,7 @@ def context_input_items(items, cache_mode):
     return result
 
 
-# Exact legacy-header recognition is retained solely for migration.
-HUD_FIELDS = ("agent_id", "mode", "response", "task", "api_call_number",
-              "pulse_call", "api_calls_remaining_after_this", "cwd", "session", "time")
-
-
-def historical_hud(group):
-    """Recognise only a request group's first, exact wrapper-generated HUD."""
-    items = group.get("items", [])
-    if group.get("kind") != "request" or not items:
-        return None
-    item = items[0]
-    if not isinstance(item, dict):
-        return None
-    content = item.get("content")
-    if (item.get("type") != "message" or item.get("role") != "developer"
-            or not isinstance(content, list) or len(content) != 1
-            or not isinstance(content[0], dict) or content[0].get("type") != "input_text"):
-        return None
-    text = content[0].get("text")
-    if not isinstance(text, str):
-        return None
-    lines = text.split("\n")
-    if len(lines) != len(HUD_FIELDS) + 2:
-        return None
-    parts = [line.partition(":") for line in lines[1:-1]]
-    if tuple(p[0] for p in parts) != HUD_FIELDS or any(p[1] != ":" for p in parts):
-        return None
-    if (lines[0] != "================ STATUS ================"
-            or lines[-1] != "========================================"):
-        return None
-    return {key: value for key, _, value in parts}
-
-
-# CONTEXT_RETENTION_V2: completed reasoning persists; historical HUDs do not.
+# Completed reasoning is retained; incomplete reasoning is not.
 def without_reasoning(value):
     """Drop typed reasoning payloads from protocol data, never from quoted text."""
     def is_reasoning(item):
@@ -357,7 +323,7 @@ def without_reasoning(value):
     return value
 
 
-# CONTEXT_BOOKKEEPING_V1: save content and facts; generate request bookkeeping.
+# Cache fields are added to the request, not saved in conversation items.
 def without_cache_markers(value):
     """Remove structured cache fields; quoted strings are never parsed or changed."""
     if isinstance(value, list):
@@ -366,54 +332,6 @@ def without_cache_markers(value):
         return {key: without_cache_markers(item) for key, item in value.items()
                 if key != "prompt_cache_breakpoint"}
     return value
-
-
-def wrapper_input_text(item, role="developer"):
-    """Exact wrapper message shape, with or without its former cache marker."""
-    if not isinstance(item, dict) or set(item) != {"type", "role", "content"}:
-        return None
-    content = item.get("content")
-    if (item.get("type") != "message" or item.get("role") != role
-            or not isinstance(content, list) or len(content) != 1):
-        return None
-    part = content[0]
-    if (not isinstance(part, dict) or part.get("type") != "input_text"
-            or not isinstance(part.get("text"), str)
-            or set(part) - {"type", "text", "prompt_cache_breakpoint"}
-            or ("prompt_cache_breakpoint" in part
-                and part["prompt_cache_breakpoint"] != {"mode": "explicit"})):
-        return None
-    return part["text"]
-
-
-def response_receipt(item):
-    """Recognise the old response sentence, including its exact optional tier suffix."""
-    text = wrapper_input_text(item)
-    match = re.fullmatch(
-        r"\[Wrapper: assistant response received ([^;\]\n]+)"
-        r"(?:; tier requested=[^\s;\[\]]+ served=[^\s;\[\]]+)?\]", text) if text is not None else None
-    return match.group(1) if match and response_datetime(match.group(1)) is not None else None
-
-
-def bookkeeping_group(group):
-    """Reading/migration copy; preserve content, attribution and existing metadata."""
-    result = dict(group)
-    items = list(group.get("items", []))
-    if (group.get("kind") == "peer" and len(items) > 1
-            and wrapper_input_text(items[0]) == WIRE_PEER_NOTICE
-            and wrapper_input_text(items[1], "user") is not None):
-        items = items[1:]
-    if group.get("kind") == "request":
-        index = 1 if historical_hud(group) is not None else 0
-        stamp = response_receipt(items[index]) if index < len(items) else None
-        if stamp is not None:
-            if response_datetime(result.get("received_at")) is None:
-                result["received_at"] = stamp
-            items = items[:index] + items[index + 1:]
-    result["items"] = without_cache_markers(items)
-    if "partial_output" in group:
-        result["partial_output"] = without_cache_markers(group["partial_output"])
-    return result
 
 
 def response_datetime(stamp):
@@ -425,33 +343,6 @@ def response_datetime(stamp):
         return result if result.utcoffset() is not None else None
     except (ValueError, TypeError, OverflowError):
         return None
-
-
-def clean_session_context(state):
-    """Keep completed reasoning; clean historical HUDs, bookkeeping and partial output."""
-    groups = state.get("groups", [])
-    for group in groups:
-        fields = historical_hud(group)
-        items = group.get("items", [])
-        if fields is not None:
-            number = fields.get("api_call_number", "")
-            if (not (type(group.get("call")) is int and group["call"] > 0)
-                    and number.isdecimal() and int(number) > 0):
-                group["call"] = int(number)
-            group.setdefault("mode", fields["mode"])
-            items = items[1:]
-        group["items"] = items
-        if "partial_output" in group:
-            partial = without_reasoning(group["partial_output"])
-            if partial is None:
-                group.pop("partial_output")
-            else:
-                group["partial_output"] = partial
-        group.update(bookkeeping_group(group))
-    if response_datetime(state.get("last_response_at")) is None:
-        state["last_response_at"] = next((g["received_at"] for g in reversed(groups)
-            if g.get("kind") == "request" and response_datetime(g.get("received_at")) is not None), None)
-    return state
 
 
 def response_gap_text(state, stamp=None):
@@ -498,16 +389,9 @@ def interaction_gap_items(state):
     return [input_message(f"[Input gap: {elapsed}]", "developer")]
 
 
-# NAMED_MEMORY_V1: one fixed selection; reversible inclusion in the normal request.
-def memory_members(memories):
-    return {number: memory for memory in memories for number in memory["groups"]}
-
-
 def context_off_ids(state):
-    members = memory_members(state.get('memories', []))
-    direct = set(state.get('off_groups', []))
-    return {g['id'] for g in state['groups']
-            if (not members[g['id']]['active'] if g['id'] in members else g['id'] in direct)}
+    off = set(state.get('off_groups', []))
+    return {g['id'] for g in state['groups'] if g['id'] in off}
 
 
 def context_selection(state):
@@ -567,42 +451,8 @@ def on_group_items(ids, marker=False):
     return [input_message(f"[{label} recently turned on: {word} {compact_group_ids(ids)}]", 'developer')]
 
 
-def default_memory_name(ids, memories=()):
-    """An ordinary group label when the human does not supply a name."""
-    label = f"Group {ids[0]}" if len(ids) == 1 else f"Groups {ids[0]}-{ids[-1]}"
-    used = {memory['name'].casefold() for memory in memories}
-    name, suffix = label, 2
-    while name.casefold() in used:
-        name = f"{label} ({suffix})"
-        suffix += 1
-    return name
-
-
-def memory_hash(groups):
-    data = json.dumps(groups, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(data.encode("utf-8")).hexdigest()
-
-
-def memory_block(state, ids):
-    selected = set(ids)
-    groups = state["groups"]
-    positions = [i for i, group in enumerate(groups) if group["id"] in selected]
-    if (not selected or len(positions) != len(selected)
-            or positions != list(range(positions[0], positions[-1] + 1))):
-        raise ValueError("Check one consecutive stretch of existing entries")
-    return [groups[i] for i in positions]
-
-
-def memory_off_items(group, memory):
-    if group["id"] != memory["groups"][0]:
-        return []
-    return [input_message(f"[Memory off: {memory['name']} ({memory['id']}); "
-                          f"groups {compact_group_ids(memory['groups'])}]", "developer")]
-
-
-# DIRECT_CONTEXT_SWITCH_V1: selected ordinary entries need no named collection.
-def off_group_runs(groups, memories=(), off_groups=()):
-    off = set(off_groups) - memory_members(memories).keys()
+def off_group_runs(groups, off_groups=()):
+    off = set(off_groups)
     runs, run = [], []
     for group in groups:
         if group['id'] in off:
@@ -620,27 +470,22 @@ def off_group_items(ids):
     return [input_message(f"[Memory off: {word} {compact_group_ids(ids)}]", 'developer')]
 
 
-def context_view(groups, cache_mode="explicit", memories=(), off_groups=(), recently_on=(), viewed_images=()):
+def context_view(groups, cache_mode="explicit", off_groups=(), recently_on=(), viewed_images=()):
     """Reading copy with one Wire notice before the first retained peer batch."""
     view, peer_notice = [], False
     viewed_images = set(viewed_images)
-    members = memory_members(memories)
-    off_runs = off_group_runs(groups, memories, off_groups)
+    off_runs = off_group_runs(groups, off_groups)
     restored = set(recently_on) - context_off_ids(
-        {'groups': groups, 'memories': memories, 'off_groups': off_groups})
+        {'groups': groups, 'off_groups': off_groups})
     markers = {g['id'] for g in groups if deletion_text(g) is not None}
     restored_markers = restored & markers
     restored -= markers
-    on_runs = off_group_runs(groups, (), restored)
+    on_runs = off_group_runs(groups, restored)
     for group in groups:
         run = off_runs.get(group['id'])
         if run is not None:
             items = off_group_items(run) if group['id'] == run[0] else []
             view.append(context_input_items(items, cache_mode))
-            continue
-        memory = members.get(group['id'])
-        if memory is not None and not memory['active']:
-            view.append(context_input_items(memory_off_items(group, memory), cache_mode))
             continue
         items = group_items(group)
         for item in items:
@@ -652,8 +497,6 @@ def context_view(groups, cache_mode="explicit", memories=(), off_groups=(), rece
                             "text": f"[Image already viewed; saved in group {group['id']}]."}
         if group['id'] in restored_markers:
             items = on_group_items([group['id']], marker=True) + items
-        if historical_hud(group) is not None:
-            items = items[1:]
         if group.get("kind") == "peer" and items and not peer_notice:
             items = [input_message(WIRE_PEER_NOTICE, "developer"), *items]
             peer_notice = True
@@ -664,19 +507,17 @@ def context_view(groups, cache_mode="explicit", memories=(), off_groups=(), rece
     return view, []
 
 
-def context_group_deltas(groups, cache_mode, memories=(), off_groups=(), recently_on=(), recently_off=(), viewed_images=()):
+def context_group_deltas(groups, cache_mode, off_groups=(), recently_on=(), recently_off=(), viewed_images=()):
     """Exact bytes removed from an input array that retains its current HUD."""
-    view, _ = context_view(groups, cache_mode, memories, off_groups, recently_on, viewed_images)
-    members = memory_members(memories)
-    off_runs = off_group_runs(groups, memories, off_groups)
+    view, _ = context_view(groups, cache_mode, off_groups, recently_on, viewed_images)
+    off_runs = off_group_runs(groups, off_groups)
     restored = set(recently_on) - context_off_ids(
-        {'groups': groups, 'memories': memories, 'off_groups': off_groups})
+        {'groups': groups, 'off_groups': off_groups})
     restored &= {g['id'] for g in groups if deletion_text(g) is None}
-    on_runs = off_group_runs(groups, (), restored)
+    on_runs = off_group_runs(groups, restored)
     deltas = [len(payload_bytes(items)) if items else 0 for items in view]
     peers = [i for i, group in enumerate(groups) if group.get("kind") == "peer" and view[i]
-             and group["id"] not in off_runs
-             and (group["id"] not in members or members[group["id"]]["active"])]
+             and group["id"] not in off_runs]
     if len(peers) > 1:
         # Removing the first batch moves the one notice to the next batch.
         notice = context_input_items([input_message(WIRE_PEER_NOTICE, "developer")], cache_mode)
@@ -699,7 +540,7 @@ def context_group_deltas(groups, cache_mode, memories=(), off_groups=(), recentl
                 if left and right and left != right:
                     deltas[index] += size(left) + size(right) - size(left + right)
     # The single tail notice shrinks when a newly hidden entry is removed.
-    state = dict(groups=groups, memories=memories, off_groups=off_groups,
+    state = dict(groups=groups, off_groups=off_groups,
                  context_changes={'off': list(recently_off)})
     hidden = set(recently_off) & context_off_ids(state)
     if hidden:
@@ -793,13 +634,12 @@ def git_head_groups(state_path):
 
 
 def context_rows(state, state_path):
-    """Build objective local measurements for /context and /context --json."""
+    """Build the context table and its size measurements."""
     checkpoint = git_head_groups(state_path)
     rows = []
     cache_mode = state["settings"]["cache_mode"]
-    deltas = context_group_deltas(state["groups"], cache_mode, state.get("memories", []), state.get("off_groups", []), state.get("context_changes", {}).get("on", []), state.get("context_changes", {}).get("off", []), state.get("viewed_images", []))
-    members = memory_members(state.get("memories", []))
-    off = set(state.get("off_groups", [])) - members.keys()
+    deltas = context_group_deltas(state["groups"], cache_mode, state.get("off_groups", []), state.get("context_changes", {}).get("on", []), state.get("context_changes", {}).get("off", []), state.get("viewed_images", []))
+    off = set(state.get("off_groups", []))
     for index, group in enumerate(state["groups"]):
         current = payload_bytes(group)
         if checkpoint is None:
@@ -822,13 +662,9 @@ def context_rows(state, state_path):
             "flags": group_flags(group),
             "preview": group_preview(group),
         })
-        memory = members.get(group['id'])
-        rows[-1]['context_active'] = memory['active'] if memory else group['id'] not in off
+        rows[-1]['context_active'] = group['id'] not in off
         if group['id'] in off:
             rows[-1]['flags'].append('CTX:OFF')
-        if memory:
-            rows[-1].update(memory_id=memory['id'], memory_name=memory['name'], memory_active=memory['active'])
-            rows[-1]['flags'].append('MEM:ON' if memory['active'] else 'MEM:OFF')
     return rows
 
 
@@ -844,64 +680,10 @@ def compact_group_ids(ids):
     return ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in runs)
 
 
-def legacy_deletion_rows(group):
-    """Recognise only exact wrapper receipts; unfamiliar records stay untouched."""
-    if group.get("kind") != "deletion":
-        return None
-    if "deletion_rows" in group:
-        return group["deletion_rows"]
-    if set(group) != {"id", "time", "kind", "note", "items"} or group["note"]:
-        return None
-    if len(group["items"]) != 1:
-        return None
-    text = visible_text(group["items"][0])
-    if wrapper_input_text(group["items"][0]) != text:
-        return None
-    match = re.fullmatch(
-        r"\[Context deletion ([^\n]+)\]\n"
-        r"(?:Call counter: (\d+); /delete commands: (\d+)\.\n)?"
-        r"Removed group IDs: ([\d, \-]+)\.\n"
-        r"Removed (\d+) of (\d+) groups( present at start)?; ([\d,]+) serialized item bytes\.", text)
-    if match is None:
-        return None
-    span, call, commands, ids_text, count, before, at_start, size = match.groups()
-    stamps = span.split(" -> ")
-    try:
-        if len(stamps) not in (1, 2) or any(datetime.fromisoformat(t).tzinfo is None for t in stamps):
-            return None
-        ids = []
-        for part in ids_text.split(", "):
-            ends = part.split("-")
-            lo, hi = int(ends[0]), int(ends[-1])
-            if len(ends) > 2 or lo < 1 or hi < lo or len(ids) + hi - lo + 1 > 1000000:
-                return None
-            ids.extend(range(lo, hi + 1))
-        if len(ids) != int(count) or len(set(ids)) != len(ids) or int(before) < len(ids):
-            return None
-        row = {"receipt_id": group["id"], "time": group["time"],
-               "deleted_at": span, "call": int(call) if call is not None else None,
-               "commands": int(commands) if commands is not None else 1,
-               "ids": ids, "before": int(before), "bytes": int(size.replace(",", "")),
-               "format": 1 if call is not None else 0}
-        if row["commands"] < 1 or bool(at_start) != bool(row["format"]):
-            return None
-        # Exact text round-trip prevents dropping anything our parser did not recognise.
-        listed = compact_group_ids(ids) if row["format"] else ", ".join(map(str, ids))
-        rebuilt = f"[Context deletion {span}]\n"
-        if row["format"]:
-            rebuilt += f"Call counter: {row['call']}; /delete commands: {row['commands']}.\n"
-        rebuilt += (f"Removed group IDs: {listed}.\n"
-                    f"Removed {len(ids)} of {row['before']} groups"
-                    f"{' present at start' if row['format'] else ''}; {row['bytes']:,} serialized item bytes.")
-        return [row] if rebuilt == text else None
-    except (ValueError, TypeError, OverflowError):
-        return None
-
-
 # POSITIONAL_MARKERS_V2: store deletion facts once; render the short line on read.
 def marker_rows(group):
     rows = (group.get("gap_rows") if group.get("kind") == "gap"
-            else legacy_deletion_rows(group))
+            else group.get("deletion_rows"))
     if (not isinstance(rows, list) or not rows or
             any(not isinstance(row, dict) or not isinstance(row.get("ids"), list)
                 or not row["ids"] or any(type(n) is not int or n < 1 for n in row["ids"])
@@ -951,15 +733,12 @@ def group_items(group):
     text = deletion_text(group)
     if text is not None:
         return [input_message(text, "developer")]
-    group = bookkeeping_group(group)
-    items = group["items"]
-    if group.get("kind") == "request" and response_datetime(group.get("received_at")) is not None:
-        index = 1 if historical_hud(group) is not None else 0
-        items = items[:index] + [input_message(f"[Response received {group['received_at']}]", "developer")] + items[index:]
+    items = copy.deepcopy(group["items"])
+    if group.get("kind") == "request" and group.get("received_at"):
+        items.insert(0, input_message(f"[Response received {group['received_at']}]", "developer"))
     notice = manual_edit_notice(group)
     if notice:
-        index = 1 if historical_hud(group) is not None else 0
-        items.insert(index, input_message(notice, "developer"))
+        items.insert(0, input_message(notice, "developer"))
     return items
 
 
@@ -1058,17 +837,17 @@ class Session:
         groups = self.state["groups"]
         self.state.setdefault("next_group_id", max((g["id"] for g in groups), default=0) + 1)
         self.state.setdefault("wire_outgoing_since", time.time())
+        # Convert old named bookmarks once on opening; keep their ON/OFF choices.
+        off = set(self.state.get("off_groups", []))
+        for memory in self.state.pop("memories", []):
+            ids = set(memory["groups"])
+            for group in groups:
+                if group["id"] in ids:
+                    group["marked"] = True
+            off = off - ids if memory["active"] else off | ids
+        self.state["off_groups"] = sorted(off)
         self.recover_pending()
-        # Old hidden entries become deletions, not a second, restorable history.
-        retained = [g for g in groups if not g.get("hidden", False)]
-        removed = len(groups) - len(retained)
-        for group in retained:
-            group.pop("hidden", None)
-        self.state["groups"] = compact_deletion_groups(retained, self.state.get("off_groups", []))
-        self.state.pop("instructions", None)  # No standing entrance prompt.
         self.save()
-        if removed:
-            print(f"Deleted {removed} previously hidden groups from session.json.")
 
     @property
     def config(self):
@@ -1076,7 +855,6 @@ class Session:
 
     @with_state_lock
     def save(self):
-        clean_session_context(self.state)
         update_context_changes(self.state)
         atomic_json(self.state_path, self.state)
 
@@ -1182,7 +960,7 @@ class Session:
 
     @with_state_lock
     def context(self):
-        view, _ = context_view(self.state["groups"], self.config["cache_mode"], self.state.get("memories", []), self.state.get("off_groups", []), self.state.get("context_changes", {}).get("on", []), self.state.get("viewed_images", []))
+        view, _ = context_view(self.state["groups"], self.config["cache_mode"], self.state.get("off_groups", []), self.state.get("context_changes", {}).get("on", []), self.state.get("viewed_images", []))
         off = context_off_ids(self.state)
         self.input_groups = [
             g["id"] for g, items in zip(self.state["groups"], view)
@@ -1218,7 +996,6 @@ class Session:
         self.lock.close()
 
 
-
 # CONSOLE_INPUT_V1: human input uses the owning console and its existing session.
 def input_application(owner):
     if not (os.environ.get('DISPLAY') or os.environ.get('WAYLAND_DISPLAY') or os.environ.get('QT_QPA_PLATFORM')):
@@ -1231,91 +1008,6 @@ def input_application(owner):
     qt.setQuitOnLastWindowClosed(False)
     owner._context_application = qt
     return qt
-
-
-def make_text_window(owner, allow_run=True):
-    from PyQt6.QtCore import QTimer
-    from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-        QPlainTextEdit, QComboBox, QSpinBox, QPushButton)
-
-    class TextWindow(QDialog):
-        def __init__(self):
-            super().__init__()
-            self.action = None
-            self.setWindowTitle(owner.session.path.name + ' · add text')
-            self.resize(820, 590)
-            layout = QVBoxLayout(self)
-            layout.addWidget(QLabel('Paste or type below. Enter adds a line; use a button when ready.'))
-            self.kind = QComboBox(); self.kind.addItems(['Human message', 'Reference text'])
-            layout.addWidget(self.kind)
-            self.editor = QPlainTextEdit(); self.editor.setPlaceholderText('Paste or type here…')
-            layout.addWidget(self.editor, 1)
-            bar = QHBoxLayout()
-            self.add_button = QPushButton('Add to context')
-            self.add_button.clicked.connect(lambda: self.choose('add', 0))
-            bar.addWidget(self.add_button)
-            self.send_button = QPushButton('Send once')
-            self.send_button.clicked.connect(lambda: self.choose('chat', 1))
-            bar.addWidget(self.send_button)
-            self.count = QSpinBox(); self.count.setRange(1, 2147483647)
-            self.count.setValue(getattr(owner, '_compose_count', 1))
-            self.count.setSuffix(' calls'); bar.addWidget(self.count)
-            self.run_button = QPushButton('Run calls')
-            self.run_button.clicked.connect(lambda: self.choose('pulse', self.count.value()))
-            bar.addWidget(self.run_button)
-            cancel = QPushButton('Cancel'); cancel.clicked.connect(self.reject); bar.addWidget(cancel)
-            for button in (self.add_button, self.send_button, self.run_button, cancel):
-                button.setAutoDefault(False); button.setDefault(False)
-            self.send_button.setVisible(allow_run)
-            self.count.setVisible(allow_run); self.run_button.setVisible(allow_run)
-            layout.addLayout(bar)
-            self.editor.textChanged.connect(self.update_buttons)
-            draft = getattr(owner, '_compose_draft', {})
-            self.kind.setCurrentIndex(1 if draft.get('reference') else 0)
-            self.editor.setPlainText(draft.get('text', ''))
-            self.update_buttons(); self.editor.setFocus()
-            self.timer = QTimer(self); self.timer.timeout.connect(lambda: None); self.timer.start(200)
-
-        def update_buttons(self):
-            enabled = bool(self.editor.toPlainText().strip())
-            self.add_button.setEnabled(enabled)
-            self.send_button.setEnabled(enabled and allow_run)
-            self.run_button.setEnabled(enabled and allow_run)
-
-        def choose(self, action, count):
-            if not self.editor.toPlainText().strip():
-                return
-            if action not in {'add', 'chat', 'pulse'} or (action != 'add' and not allow_run):
-                return
-            self.action = (action, count)
-            self.accept()
-
-        def done(self, result):
-            # Cancelled drafts remain in memory for the next visit, not a side file.
-            owner._compose_draft = {'text': self.editor.toPlainText(),
-                                    'reference': self.kind.currentIndex() == 1}
-            owner._compose_count = self.count.value()
-            super().done(result)
-    return TextWindow()
-
-
-def compose_text(owner, allow_run=True):
-    from PyQt6.QtWidgets import QDialog
-    window = make_text_window(owner, allow_run=allow_run)
-    try:
-        if window.exec() != QDialog.DialogCode.Accepted or window.action is None:
-            return None
-        text = window.editor.toPlainText()
-        if window.kind.currentIndex() == 1:
-            owner.session.group('reference',
-                [input_message(f'[Reference loaded {now()}: pasted text]\n{text}')], 'pasted text')
-        else:
-            owner.say(text)
-        owner._compose_draft = {}
-        print(f'Added {len(text):,} characters to context.')
-        return window.action
-    finally:
-        window.deleteLater()
 
 
 def load_context_files(owner, human=False, parent=None):
@@ -1525,15 +1217,8 @@ def context_reading_preview(group, sections):
 
 
 def context_call_number(group):
-    """Display the saved generation number, including older HUD-only records."""
-    if group.get("kind") != "request":
-        return ""
     call = group.get("call")
-    if type(call) is int and call > 0:
-        return str(call)
-    fields = historical_hud(group)
-    value = fields.get("api_call_number", "") if fields else ""
-    return value if value.isdecimal() and int(value) > 0 else ""
+    return str(call) if group.get("kind") == "request" and type(call) is int and call > 0 else ""
 
 
 def context_shape_rows(state, width=64, logarithmic=False):
@@ -1541,7 +1226,6 @@ def context_shape_rows(state, width=64, logarithmic=False):
     if not isinstance(width, int) or width < 1:
         raise ValueError("Shape width must be a positive integer")
     width = min(width, 64)
-    members = memory_members(state.get('memories', []))
     off = set(state.get('off_groups', []))
     rows, row, used = [], [], 0
     for group in state.get('groups', []):
@@ -1550,8 +1234,7 @@ def context_shape_rows(state, width=64, logarithmic=False):
             count = len({n for record in removed for n in record['ids']}) if removed else None
             token = ('[' + ('.' * len(str(count)) if count else '?') + ']') if logarithmic else '.'
         else:
-            memory = members.get(group['id'])
-            active = memory['active'] if memory else group['id'] not in off
+            active = group['id'] not in off
             token = '|' if active else '-'
         if row and used + len(token) > width:
             rows.append(row); row, used = [], 0
@@ -1611,18 +1294,17 @@ def context_shape(state, width=64, mode='Entries'):
     if mode == 'Shape only':
         return '\n'.join(graphics)
     groups = state.get('groups', [])
-    memories = state.get('memories', [])
     marks = [token for row in rows for _, token in row]
     on, hidden = marks.count('|'), marks.count('-')
     removed = len(marks) - on - hidden
     retained = on + hidden
     percent = lambda n: f"{100*n/retained:.1f}%" if retained else "n/a"
     cache = state['settings']['cache_mode']
-    def input_size(collections, excluded, recently_on=()):
-        view, _ = context_view(groups, cache, collections, excluded, recently_on, state.get("viewed_images", []))
+    def input_size(excluded, recently_on=()):
+        view, _ = context_view(groups, cache, excluded, recently_on, state.get("viewed_images", []))
         return len(payload_bytes([item for row in view for item in row]))
-    current = input_size(memories, state.get('off_groups', []), state.get('context_changes', {}).get('on', []))
-    all_on = input_size([dict(memory, active=True) for memory in memories], [])
+    current = input_size(state.get('off_groups', []), state.get('context_changes', {}).get('on', []))
+    all_on = input_size([])
     last = next((g['time'] for g in reversed(groups) if g.get('time')), 'unknown')
     lines = [
         f"Session {state.get('id', '?')} | API calls: {state.get('calls', 0):,}",
@@ -1643,349 +1325,6 @@ def context_shape(state, width=64, mode='Entries'):
     return '\n'.join(lines)
 
 
-def make_request_window(owner, parent=None, path=None):
-    """Read an existing request capture and the corresponding saved reply."""
-    from difflib import SequenceMatcher
-    from PyQt6.QtCore import Qt
-    from PyQt6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout,
-        QLabel, QLineEdit, QPushButton, QFileDialog, QSplitter, QTreeWidget,
-        QTreeWidgetItem, QPlainTextEdit, QTabWidget, QWidget, QMessageBox)
-
-    class RequestWindow(QDialog):
-        def __init__(self):
-            super().__init__(parent)
-            self.setWindowTitle("Captured input → saved reply")
-            screen = QApplication.primaryScreen().availableGeometry()
-            self.resize(min(1500, int(screen.width()*.95)), min(900, int(screen.height()*.9)))
-            self.raw = b""
-            self.body = None
-            self.input_items = []
-            self.preview_texts = []
-            destination = os.environ.get("LAB_OBSERVE_REQUESTS")
-            self.source_path = (Path(path).expanduser() if path is not None else
-                Path(destination).expanduser() / f"{os.getpid()}.json" if destination else None)
-            layout = QVBoxLayout(self)
-            bar = QHBoxLayout()
-            self.file_label = QLabel(); self.file_label.setTextFormat(Qt.TextFormat.PlainText)
-            self.file_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            self.file_label.setWordWrap(True); bar.addWidget(self.file_label, 1)
-            opening = QPushButton("Open capture…"); opening.clicked.connect(self.choose_file)
-            refresh = QPushButton("Refresh"); refresh.clicked.connect(lambda: self.load_capture())
-            self.compare_button = QPushButton("Compare input…")
-            self.compare_button.clicked.connect(lambda: self.compare_input())
-            bar.addWidget(opening); bar.addWidget(refresh); bar.addWidget(self.compare_button); layout.addLayout(bar)
-            self.summary = QLabel(); self.summary.setWordWrap(True)
-            self.summary.setTextFormat(Qt.TextFormat.PlainText)
-            self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            layout.addWidget(self.summary)
-            self.tabs = QTabWidget(); layout.addWidget(self.tabs, 1)
-            page = QWidget(); page_layout = QVBoxLayout(page)
-            self.search = QLineEdit(); self.search.setPlaceholderText("Find text in captured input — original indices stay unchanged")
-            self.search.setClearButtonEnabled(True); page_layout.addWidget(self.search)
-            self.splitter = QSplitter(Qt.Orientation.Horizontal)
-            self.tree = QTreeWidget(); self.tree.setColumnCount(4)
-            self.tree.setHeaderLabels(["Index", "Type / role", "Bytes", "Beginning"])
-            self.tree.setRootIsDecorated(False); self.tree.setAlternatingRowColors(True)
-            for column, width in enumerate((55, 135, 75, 190)):
-                self.tree.setColumnWidth(column, width)
-            self.splitter.addWidget(self.tree)
-            item_page = QWidget(); item_layout = QVBoxLayout(item_page)
-            self.item_label = QLabel(); self.item_label.setWordWrap(True)
-            self.item_label.setTextFormat(Qt.TextFormat.PlainText); item_layout.addWidget(self.item_label)
-            self.item_tabs = QTabWidget(); item_layout.addWidget(self.item_tabs, 1)
-            self.item_text = self.text_box(); self.item_json = self.text_box()
-            self.item_tabs.addTab(self.item_text, "Readable text")
-            self.item_tabs.addTab(self.item_json, "Item JSON")
-            self.splitter.addWidget(item_page)
-            reply_page = QWidget(); reply_layout = QVBoxLayout(reply_page)
-            self.reply_label = QLabel("Saved reply"); self.reply_label.setWordWrap(True)
-            self.reply_label.setTextFormat(Qt.TextFormat.PlainText); reply_layout.addWidget(self.reply_label)
-            self.reply_text = self.text_box(); reply_layout.addWidget(self.reply_text, 1)
-            self.splitter.addWidget(reply_page)
-            self.splitter.setSizes([430, 500, 450]); page_layout.addWidget(self.splitter, 1)
-            self.tabs.addTab(page, "Input → reply")
-            self.whole_json = self.text_box(); self.tabs.addTab(self.whole_json, "Whole request JSON (formatted)")
-            self.other_fields = self.text_box(); self.tabs.addTab(self.other_fields, "Other request fields")
-            self.compare_page = QWidget(); compare_layout = QVBoxLayout(self.compare_page)
-            notice = QLabel("Captured input values, in order. Zero-based ranges exclude the end index. "
-                "Top-level settings/instructions are outside this comparison; see the request tabs. "
-                "This compares values, not bytes or server state.")
-            notice.setWordWrap(True); compare_layout.addWidget(notice)
-            self.compare_tree = QTreeWidget(); self.compare_tree.setColumnCount(3)
-            self.compare_tree.setHeaderLabels(["Change", "EARLIER input", "LATER input"])
-            self.compare_tree.setRootIsDecorated(False); self.compare_tree.setAlternatingRowColors(True)
-            self.compare_tree.setMaximumHeight(135)
-            self.compare_tree.setColumnWidth(0, 110); self.compare_tree.setColumnWidth(1, 240)
-            compare_layout.addWidget(self.compare_tree)
-            comparison = QSplitter(Qt.Orientation.Horizontal)
-            self.compare_labels, self.compare_text, self.compare_json = [], [], []
-            for side in ("EARLIER", "LATER"):
-                pane = QWidget(); pane_layout = QVBoxLayout(pane)
-                label = QLabel(side); label.setWordWrap(True); label.setTextFormat(Qt.TextFormat.PlainText)
-                label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-                pane_layout.addWidget(label); self.compare_labels.append(label)
-                tabs = QTabWidget(); readable, literal = self.text_box(), self.text_box()
-                tabs.addTab(readable, "Readable text"); tabs.addTab(literal, "JSON by original index")
-                pane_layout.addWidget(tabs, 1); comparison.addWidget(pane)
-                self.compare_text.append(readable); self.compare_json.append(literal)
-            compare_layout.addWidget(comparison, 1)
-            self.tabs.addTab(self.compare_page, "Input comparison")
-            self.compare_tree.currentItemChanged.connect(lambda current, previous: self.show_comparison(current))
-            bottom = QHBoxLayout()
-            self.copy_button = QPushButton("Copy exact request JSON")
-            self.copy_button.clicked.connect(lambda: QApplication.clipboard().setText(self.raw.decode('utf-8')))
-            bottom.addWidget(self.copy_button)
-            note = QLabel("Read-only. JSON tabs are formatted with Unicode escapes; values are preserved. Exact copy uses the original captured text.")
-            note.setWordWrap(True); bottom.addWidget(note, 1)
-            close = QPushButton("Close"); close.clicked.connect(self.close); bottom.addWidget(close)
-            layout.addLayout(bottom)
-            self.tree.currentItemChanged.connect(lambda current, previous: self.show_item(current))
-            self.search.textChanged.connect(self.filter_items)
-            self.load_capture()
-
-        def text_box(self):
-            widget = QPlainTextEdit(); widget.setReadOnly(True)
-            widget.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
-            widget.setStyleSheet("font-family: monospace;")
-            return widget
-
-        def choose_file(self):
-            start = str(self.source_path.parent) if self.source_path else str(owner.session.path)
-            selected, _ = QFileDialog.getOpenFileName(self, "Open captured request JSON", start, "JSON (*.json);;All files (*)")
-            if selected:
-                self.load_capture(selected)
-
-        def formatted_json(self, value):
-            return json.dumps(value, ensure_ascii=True, indent=2, allow_nan=False)
-
-        def read_capture(self, path):
-            raw = Path(path).expanduser().read_bytes()
-            body = json.loads(raw.decode('utf-8'))
-            if not isinstance(body, dict) or 'input' not in body or 'groups' in body:
-                raise ValueError('Choose a captured request body, not session.json.')
-            if not isinstance(body['input'], (list, str)):
-                raise ValueError('Captured input must be a list or string.')
-            json.dumps(body, ensure_ascii=False, allow_nan=False).encode('utf-8')  # Validate numbers and Unicode before display.
-            return raw, body
-
-        def clear_comparison(self):
-            self.compared = None
-            self.compare_tree.clear()
-            for label, side in zip(self.compare_labels, ('EARLIER', 'LATER')):
-                label.setText(side + ': choose Compare input… to select an earlier capture.')
-            for widget in self.compare_text + self.compare_json:
-                widget.clear()
-
-        def input_range(self, body, start, end):
-            if isinstance(body['input'], str):
-                return 'input (whole string)' if end > start else 'no value'
-            return f'input[{start}:{end}] ({end-start:,} items)'
-
-        def compare_input(self, path=None):
-            if self.body is None:
-                return False
-            if path is None:
-                path, _ = QFileDialog.getOpenFileName(self, 'Choose EARLIER captured request',
-                    str(self.source_path.parent), 'JSON (*.json);;All files (*)')
-                if not path:
-                    return False
-            try:
-                earlier_path = Path(path).expanduser()
-                _, earlier = self.read_capture(earlier_path)
-                inputs = [body['input'] if isinstance(body['input'], list) else [body['input']]
-                          for body in (earlier, self.body)]
-                keys = [[(isinstance(body['input'], list), json.dumps(item, ensure_ascii=True,
-                            sort_keys=True, separators=(',', ':'), allow_nan=False)) for item in items]
-                        for body, items in zip((earlier, self.body), inputs)]
-                ranges = SequenceMatcher(None, *keys, autojunk=False).get_opcodes()
-                if not ranges:
-                    ranges = [('equal', 0, 0, 0, 0)]
-            except (OSError, ValueError, TypeError, UnicodeError) as error:
-                QMessageBox.warning(self, 'Input comparison unavailable', str(error))
-                return False
-            self.clear_comparison()
-            self.compared = ((earlier_path, earlier, inputs[0]),
-                             (self.source_path, self.body, inputs[1]))
-            names = {'equal': 'Same in both', 'insert': 'Only later', 'delete': 'Only earlier', 'replace': 'Different'}
-            first_change = None
-            for tag, a, b, c, d in ranges:
-                row = QTreeWidgetItem([names[tag], self.input_range(earlier, a, b),
-                                      self.input_range(self.body, c, d)])
-                row.setData(0, Qt.ItemDataRole.UserRole, (tag, a, b, c, d))
-                self.compare_tree.addTopLevelItem(row)
-                if tag != 'equal' and first_change is None:
-                    first_change = row
-            self.tabs.setCurrentWidget(self.compare_page)
-            self.compare_tree.setCurrentItem(first_change or self.compare_tree.topLevelItem(0))
-            return True
-
-        def show_comparison(self, row):
-            if row is None or self.compared is None:
-                return
-            _, a, b, c, d = row.data(0, Qt.ItemDataRole.UserRole)
-            for side, ((path, body, items), (start, end)) in enumerate(zip(self.compared, ((a, b), (c, d)))):
-                ident, call, stamp = self.capture_identity(items)
-                form = f"list ({len(items):,} items)" if isinstance(body['input'], list) else 'string (one whole value)'
-                self.compare_labels[side].setText(
-                    f"{('EARLIER', 'LATER')[side]} · session {ident or 'unknown'}" + (f" · API {call}" if call is not None else "") + "\n"
-                    f"{path}\n{form} · {self.input_range(body, start, end)}")
-                self.compare_labels[side].setToolTip(f"Input prepared at: {stamp or 'unknown'}")
-                selected = {f'input[{index}]': items[index] for index in range(start, end)}
-                if isinstance(body['input'], str):
-                    selected = {'input (whole string)': items[0]} if end > start else {}
-                self.compare_text[side].setPlainText('\n\n'.join(
-                    name + '\n' + self.readable(item) for name, item in selected.items())
-                    if selected else 'No input items in this range.')
-                self.compare_json[side].setPlainText(self.formatted_json(selected))
-
-        def readable(self, value):
-            if isinstance(value, str):
-                return value
-            if not isinstance(value, dict):
-                return json.dumps(value, ensure_ascii=False, indent=2)
-            kind = value.get('type')
-            if kind == 'message' or ('role' in value and 'content' in value):
-                content = value.get('content', [])
-                if isinstance(content, str):
-                    return content
-                if not isinstance(content, list):
-                    return json.dumps(content, ensure_ascii=False, indent=2)
-                return '\n'.join(part['text'] if isinstance(part, dict) and isinstance(part.get('text'), str)
-                    else json.dumps(part, ensure_ascii=False) for part in content)
-            if kind == 'function_call':
-                arguments = value.get('arguments', '')
-                try:
-                    arguments = json.loads(arguments)
-                except (ValueError, TypeError):
-                    pass
-                if isinstance(arguments, dict) and set(arguments) == {'command'}:
-                    return str(arguments['command'])
-                return arguments if isinstance(arguments, str) else json.dumps(arguments, ensure_ascii=False, indent=2)
-            if kind == 'function_call_output':
-                output = tool_text(value.get('output', ''))
-                try:
-                    decoded = json.loads(output)
-                except (ValueError, TypeError):
-                    decoded = output
-                if isinstance(decoded, dict) and isinstance(decoded.get('output'), str):
-                    metadata = {k:v for k,v in decoded.items() if k != 'output'}
-                    return (json.dumps(metadata, ensure_ascii=False, indent=2) + '\n\n' + decoded['output']
-                            + ('\n\n[Image attached; see Item JSON.]' if isinstance(value.get('output'), list) else ''))
-                return decoded if isinstance(decoded, str) else json.dumps(decoded, ensure_ascii=False, indent=2)
-            return json.dumps(value, ensure_ascii=False, indent=2)
-
-        def capture_identity(self, items=None):
-            for item in reversed(self.input_items if items is None else items):
-                if not isinstance(item, dict) or item.get('role') != 'developer':
-                    continue
-                text = self.readable(item)
-                ident = re.search(r'^agent_id:\s*(\S+)\s*$', text, re.M)
-                call = re.search(r'^api_call_number:\s*(\d+)\s*$', text, re.M)
-                if ident:
-                    stamp = re.search(r'^(?:input_prepared_at|time):\s*(.+)$', text, re.M)
-                    return ident.group(1), int(call.group(1)) if call else None, stamp.group(1).strip() if stamp else '?'
-            return None, None, None
-
-        def load_capture(self, path=None):
-            if path is not None:
-                self.source_path = Path(path).expanduser()
-            self.raw, self.body, self.input_items = b'', None, []
-            self.clear_comparison(); self.compare_button.setEnabled(False)
-            self.tree.clear(); self.item_label.clear(); self.reply_label.setText("Saved reply")
-            for widget in (self.item_text, self.item_json, self.reply_text, self.whole_json, self.other_fields):
-                widget.clear()
-            self.copy_button.setEnabled(False)
-            self.file_label.setText(str(self.source_path) if self.source_path else 'No capture selected')
-            try:
-                if self.source_path is None:
-                    raise ValueError('Capture is off in this process. Open a preserved capture, or set LAB_OBSERVE_REQUESTS when launching the console.')
-                raw, body = self.read_capture(self.source_path)
-                inputs = body['input']
-                self.raw, self.body = raw, body
-                self.input_items = inputs if isinstance(inputs, list) else [inputs]
-                self.whole_json.setPlainText(self.formatted_json(body))
-                self.other_fields.setPlainText(self.formatted_json({k:v for k,v in body.items() if k != 'input'}))
-                self.copy_button.setEnabled(True)
-                ident, call, stamp = self.capture_identity()
-                input_kind = f"list, {len(inputs):,} items" if isinstance(inputs, list) else 'string'
-                identity = f"Agent {ident} · input prepared {stamp}" if ident else 'No console identity found in this capture'
-                if call is not None:
-                    identity += f" · API {call}"
-                self.summary.setText(f"{identity}\ninput: {input_kind} · {len(raw):,} exact request bytes\n"
-                    f"SHA256 {hashlib.sha256(raw).hexdigest()}\nCaptured before submission; this file alone does not establish server receipt.")
-                self.preview_texts = []
-                for index, item in enumerate(self.input_items):
-                    text = self.readable(item)
-                    self.preview_texts.append(text.casefold() + '\n' + json.dumps(item, ensure_ascii=False).casefold())
-                    kind = (' / '.join(str(item.get(k, '')) for k in ('type','role')).strip(' /')
-                            if isinstance(item, dict) else type(item).__name__)
-                    row = QTreeWidgetItem([str(index), kind, f"{len(payload_bytes(item)):,}", ' '.join(text.split())[:150]])
-                    row.setData(0, Qt.ItemDataRole.UserRole, index)
-                    self.tree.addTopLevelItem(row)
-                self.show_reply(ident, call)
-                self.filter_items()
-                if self.tree.topLevelItemCount():
-                    self.tree.setCurrentItem(self.tree.topLevelItem(self.tree.topLevelItemCount()-1))
-                self.compare_button.setEnabled(True)
-            except (OSError, ValueError, TypeError, UnicodeError) as error:
-                self.raw, self.body, self.input_items, self.preview_texts = b'', None, [], []
-                self.tree.clear(); self.copy_button.setEnabled(False)
-                self.item_label.clear(); self.reply_label.setText('Saved reply')
-                for widget in (self.item_text, self.item_json, self.reply_text, self.whole_json, self.other_fields):
-                    widget.clear()
-                self.summary.setText(f"Capture unavailable: {error}\nNo request has been reconstructed or sent.")
-
-        def filter_items(self):
-            needle = self.search.text().casefold()
-            for number in range(self.tree.topLevelItemCount()):
-                self.tree.topLevelItem(number).setHidden(needle not in self.preview_texts[number])
-
-        def show_item(self, row):
-            if row is None or self.body is None:
-                return
-            index = row.data(0, Qt.ItemDataRole.UserRole)
-            item = self.input_items[index]
-            name = f'input[{index}]' if isinstance(self.body['input'], list) else 'input'
-            keys = f" · {len(item)} keys: " + ', '.join(item) if isinstance(item, dict) else ''
-            self.item_label.setText(f"{name}: {type(item).__name__}{keys}")
-            self.item_text.setPlainText(self.readable(item))
-            self.item_json.setPlainText(self.formatted_json(item))
-
-        def show_reply(self, ident, call):
-            state = owner.session.state
-            if ident is None:
-                self.reply_text.setPlainText('No session identity in the captured HUD.')
-                return
-            if ident != state['id']:
-                self.reply_text.setPlainText(f"This is agent {ident}'s request. The open session is {state['id']}; its replies were not substituted.")
-                return
-            digest = hashlib.sha256(self.raw).hexdigest()
-            matches = [g for g in state['groups'] if g.get('kind') == 'request' and
-                       (g.get('request_sha256') == digest or
-                        (call is not None and not g.get('request_sha256') and g.get('call') == call))]
-            if len(matches) != 1:
-                self.reply_text.setPlainText('No unique saved response for this captured request in the open session. It may be unfinished or deleted; the capture remains readable.')
-                return
-            group = matches[0]
-            call = group.get('call', '?')
-            self.reply_label.setText(f"Saved response · API {call} · group {group['id']}\n"
-                f"{group.get('received_at', group.get('time', '?'))} · {group.get('status', 'status unknown')}")
-            lines = ['From the open session record; not part of the captured input.']
-            if group.get('human_edits'):
-                lines.append('HUMAN-EDITED record: showing the currently saved version.')
-            output = group.get('partial_output') or group.get('items', [])
-            for item in output:
-                if item.get('type') == 'message' and item.get('role') == 'assistant':
-                    lines.extend(['', 'assistant:' + self.readable(item)])
-                elif item.get('type') == 'function_call':
-                    lines.extend(['', 'REQUESTED TOOL: ' + str(item.get('name', '?')), self.readable(item)])
-            if len(lines) == 1 or (len(lines) == 2 and group.get('human_edits')):
-                lines.append('No assistant text or requested tool saved in this record.')
-            self.reply_text.setPlainText('\n'.join(lines))
-
-    return RequestWindow()
-
-
 def make_context_window(owner, read_only=False):
     """Create a local dialog. The caller/console keeps its Session and file lock."""
     import html
@@ -1993,7 +1332,7 @@ def make_context_window(owner, read_only=False):
     from PyQt6.QtGui import QKeySequence, QShortcut, QColor, QBrush, QFont, QPalette, QTextCursor
     from PyQt6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout,
         QLabel, QLineEdit, QComboBox, QSplitter, QTreeWidget, QTreeWidgetItem,
-        QTextBrowser, QPushButton, QAbstractItemView, QMessageBox, QPlainTextEdit, QDialogButtonBox, QInputDialog,
+        QTextBrowser, QPushButton, QAbstractItemView, QMessageBox, QPlainTextEdit, QDialogButtonBox,
         QStyledItemDelegate, QStyleOptionViewItem, QStyle, QFileDialog, QWidget, QTextEdit)
 
     class ShapeView(QPlainTextEdit):
@@ -2172,9 +1511,9 @@ def make_context_window(owner, read_only=False):
             self.resize(min(1400, int(screen.width()*.94)), min(880, int(screen.height()*.9)))
             layout = QVBoxLayout(self)
             if read_only:
-                hint = "Read-only preview. Reopen the same console and use /context to delete."
+                hint = "Read-only preview. Reopen the same console and press F6 to delete."
             else:
-                hint = "Check any entries to turn off/on or delete. Named memories are optional. Shift/Ctrl selects rows."
+                hint = "Check any entries to turn off/on or delete. Shift/Ctrl selects rows."
             self.hint_label = QLabel(hint); layout.addWidget(self.hint_label)
             self.size_status = QLabel(); self.size_status.setWordWrap(True)
             self.size_status.setTextFormat(Qt.TextFormat.PlainText)
@@ -2199,9 +1538,6 @@ def make_context_window(owner, read_only=False):
             self.dense_toggle = QPushButton("Dense view"); self.dense_toggle.setCheckable(True)
             self.dense_toggle.setToolTip("Compact rows and hide the size summary. Memory controls stay visible; context and shape choice stay unchanged.")
             shape_bar.addWidget(self.dense_toggle)
-            self.request_button = QPushButton("Last request…")
-            self.request_button.clicked.connect(lambda: make_request_window(owner, parent=self).exec())
-            shape_bar.addWidget(self.request_button)
             layout.addLayout(shape_bar)
             self.shape_view = ShapeView(self); self.shape_view.setReadOnly(True)
             self.shape_view.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
@@ -2220,24 +1556,13 @@ def make_context_window(owner, read_only=False):
             bar = QHBoxLayout()
             self.search = QLineEdit(); self.search.setPlaceholderText("Search saved text…  (Ctrl+F)")
             self.search.setClearButtonEnabled(True); bar.addWidget(self.search, 1)
-            self.kind = QComboBox(); self.kind.addItems(["All entries", "Human", "Runs", "Wire", "Loaded text", "Deletion markers"])
+            self.kind = QComboBox(); self.kind.addItems(["All entries", "Human", "Runs", "Wire", "Loaded text", "Deletion markers", "Marked *"])
             bar.addWidget(self.kind)
             self.order = QComboBox(); self.order.addItems(["Chronological", "Newest first", "Largest first", "Older + larger", "Newer + larger"])
             self.order.setToolTip("Combined orders add time rank and Input KiB rank equally; lower total comes first, size breaks ties. Time is saved order. OFF rows retain their existing marker-size accounting. Type and text filters still apply.")
             bar.addWidget(self.order)
             refresh = QPushButton("Refresh"); refresh.clicked.connect(lambda: self.reload())
             bar.addWidget(refresh); lower_layout.addLayout(bar)
-            memories_bar = QHBoxLayout()
-            self.save_memory_button = QPushButton("Save as memory…")
-            self.save_memory_button.clicked.connect(lambda: self.save_memory())
-            memories_bar.addWidget(self.save_memory_button)
-            self.memory_list = QComboBox(); self.memory_list.setMinimumWidth(240)
-            memories_bar.addWidget(self.memory_list, 1)
-            self.ungroup_button = QPushButton("Ungroup")
-            self.ungroup_button.setToolTip("Remove the fixed name; keep all entries active and editable.")
-            self.ungroup_button.clicked.connect(self.ungroup_memory); memories_bar.addWidget(self.ungroup_button)
-            self.memory_list.currentIndexChanged.connect(self.update_memory_controls)
-            lower_layout.addLayout(memories_bar)
             self.splitter = QSplitter(Qt.Orientation.Horizontal)
             self.tree = QTreeWidget(); self.tree.setColumnCount(6)
             self.tree.setHeaderLabels(["✓", "Time", "API", "Type", "Input KiB", "Preview"])
@@ -2261,12 +1586,17 @@ def make_context_window(owner, read_only=False):
             mark = QPushButton("Check selection"); mark.clicked.connect(lambda: self.mark_selected(True))
             unmark = QPushButton("Clear checks"); unmark.clicked.connect(self.clear_checks)
             bottom.addWidget(mark); bottom.addWidget(unmark)
+            self.mark_button = QPushButton("Mark *")
+            self.unmark_button = QPushButton("Unmark")
+            self.mark_button.clicked.connect(lambda: self.mark_checked(True))
+            self.unmark_button.clicked.connect(lambda: self.mark_checked(False))
+            bottom.addWidget(self.mark_button); bottom.addWidget(self.unmark_button)
             self.footer = QLabel(); self.footer.setWordWrap(True); bottom.addWidget(self.footer, 1)
             self.off_checked_button = QPushButton("Turn off checked")
             self.on_checked_button = QPushButton("Turn on checked")
             for button, active in ((self.off_checked_button, False), (self.on_checked_button, True)):
                 button.clicked.connect(lambda checked=False, active=active: self.set_checked_active(active))
-                button.setToolTip("Any checked entries; choosing a named member switches its whole collection.")
+                button.setToolTip("Switch only the checked entries.")
                 bottom.addWidget(button)
             self.delete_button = QPushButton("Delete checked"); self.delete_button.clicked.connect(lambda: self.delete_checked())
             bottom.addWidget(self.delete_button)
@@ -2377,12 +1707,12 @@ def make_context_window(owner, read_only=False):
             if ident not in self.nodes:
                 self.footer.setText('That entry is no longer saved; shape refreshed.')
                 return
-            allowed = [None, {'human','human-file'}, {'request'}, {'peer'}, {'reference'}, {'gap','deletion'}][self.kind.currentIndex()]
-            if allowed is not None and self.groups[ident]['kind'] not in allowed:
+            allowed = [None, {'human','human-file'}, {'request'}, {'peer'}, {'reference'}, {'gap','deletion'}, None][self.kind.currentIndex()]
+            if ((allowed is not None and self.groups[ident]['kind'] not in allowed)
+                    or (self.kind.currentIndex() == 6 and not self.groups[ident].get('marked'))):
                 self.kind.setCurrentIndex(0)
             query = self.search.text().casefold().strip()
-            memory_name = self.members[ident]['name'].casefold() if ident in self.members else ''
-            if query and query not in self.terms[ident] and query not in memory_name and query != str(ident):
+            if query and query not in self.terms[ident] and query != str(ident):
                 self.search.clear()
             node = self.nodes[ident]
             self.tree.clearSelection()
@@ -2414,84 +1744,41 @@ def make_context_window(owner, read_only=False):
             self.tree.verticalScrollBar().setValue(scroll)
             self.reader.verticalScrollBar().setValue(reading_scroll)
 
-        def update_memory_controls(self):
-            memory = self.memories.get(self.memory_list.currentData())
+        def update_controls(self):
             allowed = not self.read_only and not self._deleting and not getattr(self.owner, 'busy', False)
-            fixed = bool(self.checked & self.members.keys())
-            self.save_memory_button.setEnabled(allowed and bool(self.checked) and not fixed)
-            self.off_checked_button.setEnabled(allowed and bool(self.checked))
-            self.on_checked_button.setEnabled(allowed and bool(self.checked))
-            self.ungroup_button.setEnabled(allowed and memory is not None)
-            if fixed:
-                self.delete_button.setEnabled(False)
+            for button in (self.off_checked_button, self.on_checked_button, self.mark_button,
+                           self.unmark_button, self.delete_button):
+                button.setEnabled(allowed and bool(self.checked))
 
         def set_checked_active(self, active):
-            if self.read_only or self._deleting or not self.checked or getattr(self.owner, 'busy', False):
-                return False
             ids = sorted(self.checked, key=self.positions.get)
-            expanded = set(ids) | {n for m in self.memories.values()
-                                  if self.checked.intersection(m['groups']) for n in m['groups']}
-            expected = {n: self.fingerprints[n] for n in expanded if n in self.fingerprints}
-            return self.memory_change(lambda: self.owner.set_context_active(
+            expected = {n: self.fingerprints[n] for n in ids}
+            return self.change_context(lambda: self.owner.set_context_active(
                 ids, active, expected=expected, expected_switches=self.inclusion_fingerprint, push=False))
 
-        def memory_change(self, action):
-            if self.read_only or self._deleting or getattr(self.owner, 'busy', False):
-                return False
-            if self.owner.session.state['id'] != self.ident:
-                self.last_error = 'Session changed; reopen this view.'
-                self.footer.setText(self.last_error)
-                return False
-            before = payload_bytes([self.owner.session.state.get('memories', []), self.owner.session.state.get('off_groups', [])])
-            self.last_error = None
-            self._deleting = True; self.setEnabled(False)
-            self.footer.setText('Recording memory change…')
-            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-            try:
-                result = action()
-                mutated = before != payload_bytes([self.owner.session.state.get('memories', []), self.owner.session.state.get('off_groups', [])])
-                self.changed = self.changed or mutated
-                if mutated:
-                    self.reload()
-                    if isinstance(result, str):
-                        self.memory_list.setCurrentIndex(self.memory_list.findData(result))
-                return result
-            except (Exception, KeyboardInterrupt) as error:
-                mutated = before != payload_bytes([self.owner.session.state.get('memories', []), self.owner.session.state.get('off_groups', [])])
-                self.changed = self.changed or mutated
-                self.last_error = str(error) or 'Memory change interrupted.'
-                if mutated:
-                    self.last_error += ' Saved change; final Git sync is still due on close.'
-                    self.reload()
-                return False
-            finally:
-                self._deleting = False; self.setEnabled(True)
-                self.update_footer()
-                if self.last_error:
-                    self.footer.setText(self.last_error)
+        def mark_checked(self, marked):
+            return self.change_context(lambda: self.owner.set_marked(list(self.checked), marked))
 
-        def save_memory(self, name=None):
+        def change_context(self, action):
             if self.read_only or self._deleting or not self.checked or getattr(self.owner, 'busy', False):
                 return False
-            ids = sorted(self.checked, key=self.positions.get)
-            if name is None:
-                default = default_memory_name(ids, self.memories.values())
-                name, accepted = QInputDialog.getText(self, 'Save as memory',
-                    f'Name (optional). Enter keeps {default}; blank uses it too.', text=default)
-                if not accepted:
-                    return False
-            expected = {n: self.fingerprints[n] for n in ids}
-            result = self.memory_change(lambda: self.owner.create_memory(ids, name, expected=expected, push=False))
-            if result:
-                self.clear_checks()
-            return result
-
-        def ungroup_memory(self):
-            memory = self.memories.get(self.memory_list.currentData())
-            if memory is None:
+            self._deleting = True
+            self.setEnabled(False)
+            try:
+                changed = action()
+                self.changed = self.changed or changed
+                self.last_error = None
+                self.reload()
+                return changed
+            except (Exception, KeyboardInterrupt) as error:
+                self.last_error = str(error) or 'Context change interrupted.'
+                self.footer.setText(self.last_error)
                 return False
-            return self.memory_change(lambda: self.owner.ungroup_memory(
-                memory['id'], expected=payload_bytes(memory), push=False))
+            finally:
+                self._deleting = False
+                self.setEnabled(True)
+                self.update_controls()
+
 
         def reload(self):
             current = self.tree.currentItem()
@@ -2521,19 +1808,7 @@ def make_context_window(owner, read_only=False):
             self.size_status.setToolTip("Built locally from current saved context, with no new message or Wire intake. No API call. Token count is from a past call, not a conversion from bytes.")
             self.shape_snapshot = snapshot
             self.render_shape()
-            selected_memory = self.memory_list.currentData()
-            self.memories = {m['id']: m for m in snapshot.get('memories', [])}
-            self.members = memory_members(self.memories.values())
-            self.off_groups = set(snapshot.get('off_groups', [])) - self.members.keys()
-            self.inclusion_fingerprint = payload_bytes([snapshot.get('memories', []),
-                                                       snapshot.get('off_groups', [])])
-            self.memory_list.blockSignals(True); self.memory_list.clear()
-            for memory in self.memories.values():
-                state = 'ON' if memory['active'] else 'OFF'
-                self.memory_list.addItem(f"{state} · {memory['name']} · {len(memory['groups'])} entries", memory['id'])
-            if selected_memory in self.memories:
-                self.memory_list.setCurrentIndex(self.memory_list.findData(selected_memory))
-            self.memory_list.blockSignals(False)
+            self.inclusion_fingerprint = payload_bytes(snapshot.get('off_groups', []))
             self.groups = {g['id']: g for g in groups}
             self.fingerprints = {g['id']: payload_bytes(g) for g in groups}
             self.positions = {g['id']: i for i, g in enumerate(groups)}
@@ -2574,7 +1849,7 @@ def make_context_window(owner, read_only=False):
             names = {"request": "Run", "human": "Human", "human-file": "Human", "peer": "Wire", "reference": "Loaded text", "gap": "Gap", "deletion": "Receipt"}
             for n in ids:
                 g, r = self.groups[n], self.rows[n]
-                preview = context_reading_preview(g, self.parts[n])
+                preview = ("* " if g.get("marked") else "") + context_reading_preview(g, self.parts[n])
                 stamp = (g.get('time') or '?')[:16].replace('T', ' ')
                 item = QTreeWidgetItem(["", stamp, context_call_number(g), names.get(g['kind'], g['kind']), f"{r['input_delta_bytes']/1024:,.1f}", preview])
                 item.setData(0, Qt.ItemDataRole.UserRole, n)
@@ -2582,13 +1857,7 @@ def make_context_window(owner, read_only=False):
                 item.setCheckState(0, Qt.CheckState.Checked if n in self.checked else Qt.CheckState.Unchecked)
                 item.setToolTip(4, f"Input change: {r['input_delta_bytes']:,} bytes\nSaved entry: {r['record_bytes']:,} bytes\n{self.input_bar_help}")
                 item.setToolTip(5, f"Group {n}\n{preview}")
-                memory = self.members.get(n)
-                if memory:
-                    state = 'ON' if memory['active'] else 'OFF'
-                    item.setText(3, 'Memory ' + state)
-                    item.setToolTip(3, memory['name'] + ' · ' + memory['id'])
-                    item.setText(5, memory['name'] + ' · ' + preview)
-                elif not r['context_active']:
+                if not r['context_active']:
                     item.setText(3, names.get(g['kind'], g['kind']) + ' OFF')
                 if not r['context_active']:
                     for column in range(6):
@@ -2605,11 +1874,12 @@ def make_context_window(owner, read_only=False):
 
         def apply_filter(self):
             query = self.search.text().casefold().strip()
-            allowed = [None, {'human','human-file'}, {'request'}, {'peer'}, {'reference'}, {'gap','deletion'}][self.kind.currentIndex()]
+            allowed = [None, {'human','human-file'}, {'request'}, {'peer'}, {'reference'}, {'gap','deletion'}, None][self.kind.currentIndex()]
             visible = []
             for n, item in self.nodes.items():
-                memory_name = self.members[n]['name'].casefold() if n in self.members else ''
-                show = (allowed is None or self.groups[n]['kind'] in allowed) and (not query or query in self.terms[n] or query in memory_name or query == str(n))
+                show = ((allowed is None or self.groups[n]['kind'] in allowed)
+                        and (self.kind.currentIndex() != 6 or self.groups[n].get('marked'))
+                        and (not query or query in self.terms[n] or query == str(n)))
                 item.setHidden(not show)
                 if show:
                     visible.append(item)
@@ -2643,14 +1913,13 @@ def make_context_window(owner, read_only=False):
                                                        if text and folded})
             chunks = ["<style>body{font-family:sans-serif;font-size:11pt;} pre{white-space:pre-wrap;font-family:monospace;} .body{white-space:pre-wrap;} h3{margin-bottom:6px;} a{text-decoration:none;}</style>"]
             call = context_call_number(g)
-            heading = f"Group {n}" + (f" · API {call}" if call else "")
+            heading = f"Group {n}" + (" *" if g.get("marked") else "") + (f" · API {call}" if call else "")
             heading += f" · Input change: {r['input_delta_bytes']/1024:,.1f} KiB"
             if not r['context_active']:
                 heading += " · OFF"
             chunks.append(f"<p>{esc(heading)}</p>")
-            memory = self.members.get(n)
             for index, (title, text, folded) in enumerate(self.parts[n]):
-                editable = self.targets[n][index] is not None and not self.read_only and memory is None
+                editable = self.targets[n][index] is not None and not self.read_only
                 edit_link = f' <a href="edit:{index}">Edit</a>' if editable else ''
                 if not text and not editable:
                     chunks.append(f"<p><i>{esc(title)}</i></p>"); continue
@@ -2710,8 +1979,6 @@ def make_context_window(owner, read_only=False):
             if self.read_only or self._deleting or getattr(self.owner, 'busy', False):
                 return False
             n = getattr(self, 'current_id', None)
-            if n in self.members:
-                return False
             if n not in self.targets or not 0 <= index < len(self.targets[n]):
                 return False
             path = self.targets[n][index]
@@ -2827,9 +2094,6 @@ def make_context_window(owner, read_only=False):
             size = sum(self.rows[n]['record_bytes'] for n in self.checked)
             message = f"{len(self.checked)} checked · {size/1024:,.1f} KiB saved entries (not API input)"
             if hidden: message += f" · {hidden} outside this filter"
-            expanded = {n for m in self.memories.values() if self.checked.intersection(m['groups']) for n in m['groups']}
-            if expanded - self.checked:
-                message += f" · on/off includes {len(expanded - self.checked)} more entries in named memories"
             pending = self.owner.session.state.get('context_changes', {})
             if pending.get('on') or pending.get('off'):
                 message += f" · next call entry changes: {len(pending.get('on', []))} ON / {len(pending.get('off', []))} OFF"
@@ -2837,7 +2101,7 @@ def make_context_window(owner, read_only=False):
             self.footer.setText(message)
             self.delete_button.setText(f"Delete checked ({len(self.checked)})")
             self.delete_button.setEnabled(bool(self.checked) and not self.read_only and not self._deleting)
-            self.update_memory_controls()
+            self.update_controls()
 
         def confirm_delete(self, ids):
             box = QMessageBox(self); box.setWindowTitle("Delete context entries")
@@ -3234,14 +2498,14 @@ class App:
     def count_input(self, body):
         size = len(payload_bytes(dict(body, stream=True)))
         if size > self.session.config["active_input_bytes"]:
-            raise ValueError(f"Request is {size:,} bytes; active_input_bytes limit is {self.session.config['active_input_bytes']:,} bytes (not tokens). Use /context, /delete or /set.")
+            raise ValueError(f"Request is {size:,} bytes; active_input_bytes limit is {self.session.config['active_input_bytes']:,} bytes (not tokens). Use F6 for context or app.settings(...).")
         return self.api.count(body)
 
     def preflight(self, body):
         s, c = self.session, self.session.config
         n = self.count_input(body)
         if n > c["active_input_tokens"] or n + c["max_output_tokens"] > c["context_window"]:
-            raise ValueError(f"Input is {n:,} tokens; configured context limit reached. Use /context, /delete or /set.")
+            raise ValueError(f"Input is {n:,} tokens; configured context limit reached. Use F6 for context or app.settings(...).")
         if self.pause:
             return None
         print(terminal_style("94") + f"Input {n:,} tokens; tier={c['service_tier']}." + terminal_style("0"), flush=True)
@@ -3469,7 +2733,7 @@ class App:
                     if image_calls:
                         s.state["viewed_images"] = sorted(set(s.state.get("viewed_images", [])) | set(image_calls))
                 else:
-                    group["partial_output"] = output
+                    group["partial_output"] = without_reasoning(output)
                     group["items"].append(input_message(
                         "[Previous response incomplete or failed; no commands executed. Partial output is saved in this group.]"))
                 s.state["pending"] = {"stage": "response", "group": group["id"]}
@@ -3573,18 +2837,6 @@ class App:
         if display:
             print(display, flush=True)
 
-    def paste(self, *, terminal=False):
-        if not terminal and input_application(self) is not None:
-            choice = compose_text(self)
-            if choice:
-                action, count = choice
-                if action == 'chat':
-                    self.one()
-                elif action == 'pulse':
-                    self.run_pulses(count)
-            return
-        self._paste_lines = []
-        print("Finish with /end to save; /cancel discards. F3 requests a reply separately.")
 
     def load(self, path, human=False):
         path = path.expanduser().resolve(strict=True)
@@ -3618,58 +2870,56 @@ class App:
 
     @with_state_lock
     def set_context_active(self, ids, active, expected=None, expected_switches=None, push=False):
-        """Switch scattered entries and any containing named collections together."""
         s = self.session
-        if getattr(self, 'busy', False) or s.state.get('pending'):
+        if self.busy or s.state.get('pending'):
             raise ValueError("Wait for the current call to finish")
-        if type(active) is not bool:
-            raise ValueError("Choose context on or off")
         selected = set(ids)
         groups = {g['id']: g for g in s.state['groups']}
-        if not selected or not selected <= groups.keys():
-            raise ValueError("Check existing context entries")
-        memories = s.state.get('memories', [])
-        switches = payload_bytes([memories, s.state.get('off_groups', [])])
+        if type(active) is not bool or not selected or not selected <= groups.keys():
+            raise ValueError("Choose existing entries and True or False")
+        switches = payload_bytes(s.state.get('off_groups', []))
         if expected_switches is not None and expected_switches != switches:
             raise ValueError("Context switches changed; refresh")
-        affected = [m for m in memories if selected.intersection(m['groups'])]
-        expanded = selected | {n for m in affected for n in m['groups']}
-        if not expanded <= groups.keys():
-            raise ValueError("Memory entries changed; refresh")
-        if expected is not None and any(expected.get(n) != payload_bytes(groups[n]) for n in expanded):
-            raise ValueError("Context changed; refresh before switching")
-        for memory in affected:
-            if memory_hash(memory_block(s.state, memory['groups'])) != memory['sha256']:
-                raise ValueError("Fixed memory contents changed; ungroup before making a new version")
-        original = {n: payload_bytes(groups[n]) for n in expanded}
-        affected_ids = {m['id'] for m in affected}
-        updated = [dict(m, active=active) if m['id'] in affected_ids else m for m in memories]
-        named = memory_members(memories)
-        off = set(s.state.get('off_groups', [])) - named.keys()
-        ordinary = selected - named.keys()
-        off = off - ordinary if active else off | ordinary
-        off = sorted(off)
-        if payload_bytes([updated, off]) == switches:
+        if expected is not None and any(expected.get(n) != payload_bytes(groups[n]) for n in selected):
+            raise ValueError("Context changed; refresh")
+        off = set(s.state.get('off_groups', []))
+        updated = sorted(off - selected if active else off | selected)
+        if updated == sorted(off):
             return False
-        label = ('on ' if active else 'off ') + compact_group_ids(sorted(expanded))
-        if not self.record_git('before context ' + label, required=True):
-            raise ValueError("Pre-switch Git recording failed; context unchanged")
-        current = {g['id']: g for g in s.state['groups']}
-        if (payload_bytes([s.state.get('memories', []), s.state.get('off_groups', [])]) != switches
-                or any(n not in current or payload_bytes(current[n]) != value for n, value in original.items())):
-            raise ValueError("Context changed while checkpointing; refresh")
-        self._save_memories(updated, 'context ' + label, push, off_groups=off)
+        label = ('on ' if active else 'off ') + compact_group_ids(sorted(selected))
+        self.record_git('before context ' + label, required=True)
+        self._save_switches(updated, 'context ' + label, push)
         return True
 
     @with_state_lock
-    def _save_memories(self, memories, event, push=False, off_groups=None):
+    def set_marked(self, ids, marked=True):
+        s = self.session
+        if self.busy or s.state.get('pending'):
+            raise ValueError("Wait for the current call to finish")
+        selected = set(ids)
+        groups = [dict(g) for g in s.state['groups']]
+        if type(marked) is not bool or not selected or not selected <= {g['id'] for g in groups}:
+            raise ValueError("Choose existing entries and True or False")
+        changed = False
+        for group in groups:
+            if group['id'] in selected and bool(group.get('marked')) != marked:
+                changed = True
+                if marked:
+                    group['marked'] = True
+                else:
+                    group.pop('marked', None)
+        if changed:
+            s.state['groups'] = groups
+            s.save()
+            self.record_git('mark entries' if marked else 'unmark entries')
+        return changed
+
+    @with_state_lock
+    def _save_switches(self, off_groups, event, push=False):
         s = self.session
         previous = s.state
         s.state = dict(previous)
-        if memories or 'memories' in previous:
-            s.state['memories'] = memories
-        if off_groups is not None:
-            s.state['off_groups'] = off_groups
+        s.state['off_groups'] = off_groups
         update_context_changes(s.state, previous)
         switches = len(context_off_ids(previous) ^ context_off_ids(s.state))
         if switches:
@@ -3690,82 +2940,6 @@ class App:
         if not self.record_git(event, push=push):
             raise ValueError("Memory change saved; Git recording/sync is still due")
 
-    @with_state_lock
-    def create_memory(self, ids, name="", expected=None, push=False):
-        s = self.session
-        if getattr(self, "busy", False) or s.state.get("pending"):
-            raise ValueError("Wait for the current call to finish")
-        if not isinstance(name, str):
-            raise ValueError("Use a name or leave it blank")
-        block = memory_block(s.state, ids)
-        memories = s.state.get("memories", [])
-        name = name.strip() or default_memory_name([g['id'] for g in block], memories)
-        if len(name) > 80 or any(ord(c) < 32 for c in name):
-            raise ValueError("Use up to 80 characters on one line, or leave the name blank")
-        if any(m['name'].casefold() == name.casefold() for m in memories):
-            raise ValueError("That memory name already exists")
-        members = memory_members(memories)
-        if any(g['id'] in members for g in block):
-            raise ValueError("That stretch already belongs to a memory")
-        if any(g.get('kind') in {'gap', 'deletion'} for g in block):
-            raise ValueError("Select content entries, not deletion markers")
-        if expected is not None and any(expected.get(g['id']) != payload_bytes(g) for g in block):
-            raise ValueError("Context changed; refresh before naming the memory")
-        # A whole saved request normally contains both sides of every tool pair.
-        for group in block:
-            calls = [i.get('call_id') for i in group.get('items', []) if i.get('type') == 'function_call']
-            results = [i.get('call_id') for i in group.get('items', []) if i.get('type') == 'function_call_output']
-            if (any(not isinstance(c, str) or not c for c in calls + results)
-                    or sorted(calls) != sorted(results) or len(set(calls)) != len(calls)):
-                raise ValueError("Select completed command/result pairs")
-        before = memory_hash(block)
-        off_before = payload_bytes(s.state.get('off_groups', []))
-        memories_before = payload_bytes(memories)
-        if not self.record_git("before save memory " + name, required=True):
-            raise ValueError("Pre-memory Git recording failed; selection unchanged")
-        block = memory_block(s.state, ids)
-        if (memory_hash(block) != before
-                or payload_bytes(s.state.get('memories', [])) != memories_before
-                or payload_bytes(s.state.get('off_groups', [])) != off_before):
-            raise ValueError("Context changed while checkpointing; refresh")
-        memories = s.state.get('memories', [])
-        root = Path(subprocess.check_output(['git', '-C', str(s.path), 'rev-parse', '--show-toplevel'], text=True).strip()).resolve()
-        commit = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()
-        memory = dict(id=s.state['id'] + '/' + uuid4().hex[:8], name=name,
-                      groups=[g['id'] for g in block], active=True, created_at=now(),
-                      source_session=s.state['id'], source_git=commit,
-                      source_path=s.state_path.relative_to(root).as_posix(), sha256=before)
-        off = [n for n in s.state.get('off_groups', []) if n not in memory['groups']]
-        self._save_memories([*memories, memory], "saved memory " + name, push,
-                            off_groups=off if 'off_groups' in s.state else None)
-        return memory['id']
-
-    @with_state_lock
-    def set_memory_active(self, memory_id, active, expected=None, push=False):
-        memory = next((m for m in self.session.state.get('memories', [])
-                       if m['id'] == memory_id), None)
-        if memory is None or (expected is not None and payload_bytes(memory) != expected):
-            raise ValueError("Memory changed; refresh")
-        return self.set_context_active(memory['groups'], active, push=push)
-
-    @with_state_lock
-    def ungroup_memory(self, memory_id, expected=None, push=False):
-        s = self.session
-        if getattr(self, "busy", False) or s.state.get("pending"):
-            raise ValueError("Wait for the current call to finish")
-        memories = s.state.get('memories', [])
-        memory = next((m for m in memories if m['id'] == memory_id), None)
-        if memory is None or (expected is not None and payload_bytes(memory) != expected):
-            raise ValueError("Memory changed; refresh")
-        memories_before = payload_bytes(memories)
-        if not self.record_git("before ungroup memory " + memory['name'], required=True):
-            raise ValueError("Pre-ungroup Git recording failed")
-        if payload_bytes(s.state.get('memories', [])) != memories_before:
-            raise ValueError("Memory changed while checkpointing; refresh")
-        memories = s.state.get('memories', [])
-        self._save_memories([m for m in memories if m['id'] != memory_id],
-                            "ungrouped memory " + memory['name'], push)
-        return True
 
     @with_state_lock
     def edit_context(self, group_id, path, text, expected=None, push=False):
@@ -3777,8 +2951,6 @@ class App:
         if index is None:
             raise ValueError("This entry no longer exists; refresh")
         group = s.state['groups'][index]
-        if group_id in memory_members(s.state.get('memories', [])):
-            raise ValueError("Fixed memory: ungroup it before editing")
         original = payload_bytes(group)
         if expected is not None and original != expected:
             raise ValueError("Context changed; refresh before editing")
@@ -3817,11 +2989,9 @@ class App:
         s = self.session
         groups = s.state["groups"]
         selected = set(ids)
-        if selected & memory_members(s.state.get('memories', [])).keys():
-            raise ValueError("Fixed memory: turn it off, or ungroup it before deleting")
         if not selected or not selected <= {g["id"] for g in groups}:
-            raise ValueError("Use group IDs from /context")
-        self.record_git("before /delete " + " ".join(map(str, ids)), required=True)
+            raise ValueError("Use entry IDs from the context window")
+        self.record_git("before delete " + " ".join(map(str, ids)), required=True)
         replacement = delete_in_place(groups, selected, now(), s.state["calls"], s.state.get("off_groups", []))
         previous = s.state
         s.state = dict(previous, groups=replacement)
@@ -3837,7 +3007,7 @@ class App:
             raise
         print("Deleted selection:", ", ".join(map(str, ids)))
         print("Content gaps remain in place; adjacent gaps/old receipts compacted. See open_context_window(app).")
-        self.record_git("after /delete " + " ".join(map(str, ids)), push=push)
+        self.record_git("after delete " + " ".join(map(str, ids)), push=push)
 
     def status(self):
         s, c = self.session, self.session.config
@@ -3848,7 +3018,7 @@ class App:
     def settings(self, key, value):
         config = dict(self.session.config)
         if key not in DEFAULTS:
-            raise ValueError("Unknown setting; /set lists them")
+            raise ValueError("Unknown setting; see session.config")
         old = config[key]
         if type(old) is bool:
             if value.lower() not in {"true", "false", "on", "off"}:
@@ -3878,7 +3048,7 @@ class App:
         suffix = '' if job is None else f" | human-control {job['request_id']}"
         completed = False
         try:
-            self.record_git(f"start /pulse {count}" + suffix, push=True, force=True)
+            self.record_git(f"start run {count}" + suffix, push=True, force=True)
             for left in range(count, 0, -1):
                 endpoint.progress(count-left, self.session.state['calls'])
                 if not endpoint.before_call(self.receive_text):
@@ -3891,7 +3061,7 @@ class App:
         finally:
             endpoint.finish(self.session.state['calls'], self.session.state['calls']-before,
                             'finished' if completed else 'paused/error')
-            self.record_git(f"end /pulse {count}" + suffix, push=True)
+            self.record_git(f"end run {count}" + suffix, push=True)
         print("\nBatch finished.")
         return completed
 
@@ -3914,12 +3084,8 @@ class App:
             self.session.close()
 
 
-
-
-
-
-
     def repl(self):
+        from code import InteractiveConsole
         from prompt_toolkit import PromptSession
         from prompt_toolkit.key_binding import KeyBindings
         from prompt_toolkit.buffer import Buffer
@@ -3939,10 +3105,22 @@ class App:
                 raise APIError("No API key supplied")
         actions = queue.Queue()
         closed, working = threading.Event(), threading.Event()
-        self._paste_lines = None
+        python = InteractiveConsole(dict(globals(), app=self, session=self.session))
 
         def read_input():
             bindings = KeyBindings()
+            python_mode = False
+            @bindings.add('f6')
+            def context(event):
+                actions.put(partial(open_context_window, self))
+            @bindings.add('f7')
+            def load_files(event):
+                actions.put(partial(load_context_files, self))
+            @bindings.add('f8')
+            def toggle_python(event):
+                nonlocal python_mode
+                python_mode = not python_mode
+                event.app.invalidate()
             calls = Buffer(document=Document('10'), multiline=False)
             @bindings.add('f3')
             def reply(event):
@@ -4092,8 +3270,8 @@ class App:
                 with self.endpoint.lock:
                     run = self.endpoint.running
                     progress = f"Run {run['pulse']}/{run['count']}" if run else state
-                mode = "Recording; Enter finishes" if recording else "Transcribing" if voice_process is not None else "Keyboard"
-                return f"{self.session.path.name} / {self.session.state['id']} | {mode} | {progress} | waiting: {actions.qsize()} | F2 mic | Tab calls | F3 reply | F4 run | F5 reread"
+                mode = "Recording; Enter finishes" if recording else "Transcribing" if voice_process is not None else "Python" if python_mode else "Text"
+                return f"{self.session.path.name} / {self.session.state['id']} | {mode} | {progress} | waiting: {actions.qsize()} | F2 mic | Tab calls | F3 reply | F4 run | F5 reread | F6 context | F7 files | F8 Python"
 
             def wake(context):
                 while not context.input_is_ready():
@@ -4112,7 +3290,7 @@ class App:
                 try:
                     while not closed.is_set():
                         try:
-                            line = prompt.prompt("\ntext:", inputhook=wake, default=draft,
+                            line = prompt.prompt("\n... " if python_mode and python.buffer else "\n>>> " if python_mode else "\ntext:", inputhook=wake, default=draft,
                                                  bottom_toolbar=toolbar, refresh_interval=.2,
                                                  handle_sigint=False)
                             if line is None:
@@ -4120,21 +3298,10 @@ class App:
                                 self.receive_text()
                                 continue
                             draft = ""
-                            if self._paste_lines is not None:
-                                if line == '/end':
-                                    self.say("\n".join(self._paste_lines))
-                                    self._paste_lines = None
-                                elif line == '/cancel':
-                                    self._paste_lines = None
-                                else:
-                                    self._paste_lines.append(line)
-                            elif line in {'/quit', '/exit'}:
-                                break
+                            if python_mode:
+                                actions.put(partial(python.push, line))
                             elif line.strip():
-                                if not line.startswith('/') or '\n' in line or '\r' in line:
-                                    self.say(line)
-                                else:
-                                    actions.put(partial(self.dispatch, line))
+                                self.say(line)
                         except EOFError:
                             break
                         except KeyboardInterrupt:
@@ -4158,7 +3325,7 @@ class App:
                         voice_thread.join()
 
         self.status()
-        print("Enter saves text. F2 records; Enter finishes. F3 replies. Tab edits Calls; F4 runs them. F5 rereads; PgUp/PgDn scroll the pinned reply. /help", flush=True)
+        print("Enter saves text. F2 records; Enter finishes. F3 replies. Tab edits Calls; F4 runs them. F5 rereads; PgUp/PgDn scroll the pinned reply. F6 context; F7 files; F8 Python (app/session); Ctrl-D closes.", flush=True)
         reader = threading.Thread(target=read_input, name='knight-terminal')
         reader.start()
         try:
@@ -4184,100 +3351,6 @@ class App:
             closed.set()
             self.endpoint.signal()
             reader.join()
-
-
-
-
-    def dispatch(self, line):
-        with self.session.state_lock:
-            note_interaction(self.session.state)
-        parts = line.split(maxsplit=2)
-        cmd, *args = parts if parts[0] == "/pulse" else shlex.split(line)
-        if cmd == "/help":
-            print(HELP)
-        elif cmd == "/status":
-            self.status()
-        elif cmd == "/hud":
-            print(visible_text(self.control("CHAT", 1)))
-        elif cmd == "/send":
-            self.one()
-        elif cmd == "/git" and not args:
-            self.record_git("manual", push=True)
-        elif cmd == "/pulse" and args:
-            count = int(args[0])
-            if count <= 0:
-                raise ValueError("Use a positive call count")
-            if len(args) == 2:
-                self.say(args[1])
-            self.run_pulses(count)
-        elif cmd == "/paste" and args in ([], ["--text"]):
-            self.paste(terminal=bool(args))
-        elif cmd in {"/load", "/message"} and not args:
-            load_context_files(self, human=cmd == "/message")
-        elif cmd in {"/load", "/message"} and len(args) == 1:
-            self.load(Path(args[0]), human=cmd == "/message")
-        elif cmd == "/context" and not args:
-            open_context_window(self)
-        elif cmd == "/context" and args == ["--text"]:
-            self.show_context()
-        elif cmd == "/context" and args == ["--json"]:
-            self.show_context(json_output=True)
-        elif cmd == "/delete":
-            self.delete([int(i) for i in args])
-        elif cmd == "/tokens":
-            print("Input tokens:", self.count_input(self.body()))
-        elif cmd == "/effort" and len(args) == 1:
-            self.settings("effort", args[0])
-        elif cmd == "/cd" and len(args) == 1:
-            path = Path(args[0]).expanduser().resolve(strict=True)
-            if not path.is_dir():
-                raise ValueError("Not a directory")
-            with self.session.state_lock:
-                self.session.state["cwd"] = str(path)
-                self.session.save()
-        elif cmd == "/set" and len(args) == 2:
-            self.settings(*args)
-        elif cmd == "/set" and not args:
-            print(json.dumps({key: self.session.config[key] for key in DEFAULTS}, indent=2))
-        else:
-            print("Unknown command or arguments. /help")
-
-HELP = """Enter saves text. F3 or /send requests one text reply; no execution.
-Tab edits Calls; F4 runs that count. F5 rereads; PgUp/PgDn scroll the pinned reply; no request or draft submission.
-F2 starts microphone recording; Enter or F2 finishes and transcribes. No reply is requested.
-/pulse N [TEXT]   N sequential generations with Bash permitted; then text.
-                  Optional TEXT is a literal human message added once before the run.
-                  Text-only replies do not stop the batch. Interrupts/errors/limits do.
-/paste           Compose text locally; choose Add, Send once, or Run calls. --text keeps terminal entry.
-/load [FILE]     Load reference text; omit FILE for a file chooser. No request yet.
-/message [FILE]  Load your own message; omit FILE for a file chooser. No request yet.
-/send             One text reply to the saved input.
-/git              Commit this session and push to its upstream; no model request.
-/context         Read/search/check/delete context in a local window. Record on close.
-/context --text   Original printed table; --json returns its machine-readable form.
-/delete ID ...    Replace content in place with gap markers; adjacent gaps compact.
-                  Deleting a gap/deletion row removes that marker outright.
-                  Old receipts compact where they already sit, not into inferred old gaps.
-/status           Current session and call count.
-/hud              Show the next text HUD.
-/tokens           Count next text input on the server; no generation.
-/set [KEY VALUE]  List or edit settings. /effort also works.
-                  /set auto_push on | off: automatic pushes (default off); /git always pushes.
-                  /set service_tier fast | default: per-session speed; no model call.
-/cd DIRECTORY     Change Bash working directory.
-/quit             Save and close.
-Ctrl-C pauses after the current operation; a second Ctrl-C interrupts it.
-Bash can return one absolute PNG/JPEG/WebP path; pixels appear for one completed response and stay saved.
-Addressed Wire peers are checked before each request (20 messages / 16 KiB max).
-LAB_WIRE_RECEIVE=0 disables intake; /context shows peer groups; /delete trims them.
-Git: local session/graph commits always; auto_push controls automatic pushes.
-/delete first requires an exact local Git copy; a failed push retains local commits.
-Git recording does not stage other project files or change task-completion cues.
-Completed reasoning is retained; reasoning_context controls API reuse. Incomplete reasoning is discarded.
-HUD and elapsed time are current-request only.
-No autonomous wake-ups, automatic conversation trimming, retries, forks or extra model calls.
-Remote pulses are explicit allocations; socket text only appends human/peer input.
-"""
 
 
 def main():
