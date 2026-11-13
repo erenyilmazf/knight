@@ -38,16 +38,29 @@ export OPENAI_API_KEY
 python3 -B knight.py --session first
 ```
 
-Use `/set model YOUR_MODEL_ID` to select a model available to your account;
-`/set` shows the other settings. Choose compatible effort, token limits and
-cache settings for that model before requesting a response; the defaults
-come from the original deployment. `/help` lists the controls.
-
 Type a message and press Enter to save it. F3 requests a text response.
-Tab selects the Calls field; F4 runs the specified tool-using pulses.
-`/cd DIRECTORY` chooses the working directory. `/context` opens the saved
-conversation controls. `/quit` saves and closes the session.
+Tab selects the Calls field; F4 runs that many tool-using responses.
+F2 records voice; F5 rereads the last reply; F6 opens context; F7 loads files.
+Ctrl-D closes the console. Reopen with the same `--session` name to continue.
 Use `python3 -B knight.py --list` to list saved session names.
+
+F8 switches between message entry and actual Python. In Python, `app` and
+`session` are the running console objects. For example:
+
+```python
+app.settings("model", "YOUR_MODEL_ID")
+session.config
+app.say("A message to save")
+```
+
+Choose a model, effort and request limits compatible with your account before
+requesting a response. Press F8 again to return to ordinary message entry.
+To change Bash's starting directory from Python:
+
+```python
+session.state["cwd"] = str(Path.home())
+session.save()
+```
 
 Shell commands run with the permissions of the Unix user launching Knight.
 Model requests use that user’s API account.
@@ -55,26 +68,28 @@ Model requests use that user’s API account.
 Session files live in `~/.local/share/knight/sessions/`. Set `KNIGHT_HOME` to
 choose another data directory, outside the source checkout. The shared Wire
 journal is `$KNIGHT_HOME/messages.jsonl`. The local Git setup above is required
-for context switching, named memories and deletion: each change preserves a
+for context switching and deletion: each change preserves a
 checkpoint. Session JSON is saved even when Git recording fails.
 
-No Git remote is needed. Automatic pushes default to off; `/git` explicitly
-pushes session history if an upstream is configured. Keep the data repository
+No Git remote is needed. Automatic pushes default to off;
+`app.record_git("manual", push=True)` pushes if an upstream is configured. Keep the data repository
 separate from any public source repository. Deleting context does not erase its
 older Git checkpoints.
 
 For the graphical context view, install `PyQt6` in the same Python environment.
 Check entries, then use **Turn off checked** or **Turn on checked** to change
-their inclusion; named memories keep a consecutive selection together.
-Without PyQt6 or a display,
-`/context` shows a text table; `/context --json` gives the same rows as JSON.
+their inclusion. **Mark \*** and **Unmark** add or remove a bookmark, without
+changing inclusion. Choose **Marked \*** to find those entries. Old named
+bookmarks become independent marks on reopening, preserving their ON/OFF state.
+Without PyQt6 or a display, F6 shows a text table;
+`app.show_context(json_output=True)` returns its rows as JSON.
 For F2 microphone transcription, install `openai` in the same environment
 and PipeWire’s `pw-record` command. The helper uses the transcription model
 configured in `tools/voice.py`.
 
 ## Wire
 
-Use the session ID shown by `/status` as the recipient, or set
+Use the session ID printed when the console opens as the recipient, or set
 `LAB_WIRE_HANDLE` before launch to give a session an additional address.
 
 ```bash
@@ -91,7 +106,7 @@ path for both tools; `LAB_WIRE_RECEIVE=0` disables automatic intake.
 
 In a working directory of your choice, ask an agent to inspect a small source
 file, run it, and explain the result. Keep the conversation open, toggle an old
-group in `/context`, and inspect the next request. The saved `session.json`
+entry in the F6 context window, and inspect the next request. The saved `session.json`
 records the interaction for later review.
 
 ## Project
