@@ -40,8 +40,13 @@ python3 -B knight.py --session first
 
 Type a message and press Enter to save it. F3 requests a text response.
 Tab selects the Calls field; F4 runs that many tool-using responses.
-F2 records voice; F5 rereads the last reply; F6 opens context; F7 loads files.
+F2 records voice; F5 shows the last reply; F6 opens context; F7 adds files.
 Ctrl-D closes the console. Reopen with the same `--session` name to continue.
+
+Input tokens are counted automatically through the API after saved changes settle.
+Counting runs in the background; unfinished typing is excluded. The display says
+`(saved text)` for the next text-request preview, or `(request)` for the count
+used before generation. No model reply is requested by the background counter.
 Use `python3 -B knight.py --list` to list saved session names.
 
 F8 switches between message entry and actual Python. In Python, `app` and

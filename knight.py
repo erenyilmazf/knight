@@ -2456,6 +2456,7 @@ class App:
         self.pulse_total = 1
         self.endpoint = PulseControl(session)
         self.last_reply = "No reply yet in this console."
+        self.token_status = "Input tokens: waiting…"
 
     def interrupt(self, signum, frame):
         if not self.busy or self.pause:
@@ -2499,7 +2500,37 @@ class App:
         size = len(payload_bytes(dict(body, stream=True)))
         if size > self.session.config["active_input_bytes"]:
             raise ValueError(f"Request is {size:,} bytes; active_input_bytes limit is {self.session.config['active_input_bytes']:,} bytes (not tokens). Use F6 for context or app.settings(...).")
-        return self.api.count(body)
+        total = self.api.count(body)
+        self.token_status = f"Input tokens: {total:,} (request)"
+        return total
+
+    def watch_input_tokens(self, closed):
+        counter = API(timeout=20)
+        previous = counted = None
+        while not closed.wait(.5):
+            with self.session.state_lock:
+                if self.busy or self.endpoint.running is not None or self.session.state.get("pending"):
+                    continue
+                saved = self.session.state_path.stat().st_mtime_ns
+                if saved != previous:
+                    previous = saved
+                    self.token_status = "Input tokens: updating…"
+                    continue  # Wait for saved changes to settle before counting.
+                if saved == counted:
+                    continue
+                body = self.body()
+            self.token_status = "Input tokens: counting…"
+            try:
+                counter.key = self.api.key
+                total = counter.count(body)
+                text = f"Input tokens: {total:,} (saved text)"
+            except (APIError, OSError, ValueError) as error:
+                text = f"Input tokens: unavailable — {str(error).splitlines()[0][:80]}"
+            with self.session.state_lock:
+                counted = saved
+                if (not closed.is_set() and not self.busy and self.endpoint.running is None
+                        and self.session.state_path.stat().st_mtime_ns == saved):
+                    self.token_status = text
 
     def preflight(self, body):
         s, c = self.session, self.session.config
@@ -3126,7 +3157,7 @@ class App:
             def reply(event):
                 actions.put(self.one)
             @bindings.add('f5')
-            def reread(event):
+            def show_last_reply(event):
                 heading, newline, text = self.last_reply.partition("\n")
                 print(terminal_style("38;2;255;112;112") + "\n" + heading + terminal_style("97") + newline + text + terminal_style("0"), flush=True)
             @bindings.add('pageup')
@@ -3263,7 +3294,8 @@ class App:
             hint = ConditionalContainer(Window(FormattedTextControl(reply_hint), height=1,
                                               style="fg:#ff7070"), filter=Condition(lambda: bool(reply_hint())))
             pinned_reply = ConditionalContainer(HSplit([reply_pane, hint]), filter=~is_done)
-            prompt.layout.container = HSplit([pinned_reply, Window(count_control, height=1, style="fg:#ff7070"), prompt.layout.container])
+            token_line = Window(FormattedTextControl(lambda: self.token_status), height=1, style="fg:#e6c478")
+            prompt.layout.container = HSplit([pinned_reply, token_line, Window(count_control, height=1, style="fg:#ff7070"), prompt.layout.container])
 
             def toolbar():
                 state = 'working' if working.is_set() else 'ready'
@@ -3271,7 +3303,7 @@ class App:
                     run = self.endpoint.running
                     progress = f"Run {run['pulse']}/{run['count']}" if run else state
                 mode = "Recording; Enter finishes" if recording else "Transcribing" if voice_process is not None else "Python" if python_mode else "Text"
-                return f"{self.session.path.name} / {self.session.state['id']} | {mode} | {progress} | waiting: {actions.qsize()} | F2 mic | Tab calls | F3 reply | F4 run | F5 reread | F6 context | F7 files | F8 Python"
+                return f"{self.session.path.name} / {self.session.state['id']} | {mode} | {progress} | waiting: {actions.qsize()} | F2 mic | Tab calls | F3 reply | F4 run | F5 Show last reply | F6 context | F7 Add files | F8 Python"
 
             def wake(context):
                 while not context.input_is_ready():
@@ -3325,7 +3357,9 @@ class App:
                         voice_thread.join()
 
         self.status()
-        print("Enter saves text. F2 records; Enter finishes. F3 replies. Tab edits Calls; F4 runs them. F5 rereads; PgUp/PgDn scroll the pinned reply. F6 context; F7 files; F8 Python (app/session); Ctrl-D closes.", flush=True)
+        print("F2 records; Enter finishes. F3 replies. Tab edits Calls; F4 runs them. F5 Show last reply; PgUp/PgDn scroll the pinned reply. F6 context; F7 Add files; F8 Python (app/session); Ctrl-D closes.", flush=True)
+        threading.Thread(target=self.watch_input_tokens, args=(closed,),
+                         name='knight-token-count', daemon=True).start()
         reader = threading.Thread(target=read_input, name='knight-terminal')
         reader.start()
         try:
