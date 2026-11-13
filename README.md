@@ -82,6 +82,8 @@ separate from any public source repository. Deleting context does not erase its
 older Git checkpoints.
 
 For the graphical context view, install `PyQt6` in the same Python environment.
+**Add text…** opens a multiline box for pasting or typing a message.
+**Add** saves it into context; F3 or F4 requests the next response.
 Check entries, then use **Turn off checked** or **Turn on checked** to change
 their inclusion. **Mark \*** and **Unmark** add or remove a bookmark, without
 changing inclusion. Choose **Marked \*** to find those entries. Old named

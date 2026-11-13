@@ -1332,7 +1332,7 @@ def make_context_window(owner, read_only=False):
     from PyQt6.QtGui import QKeySequence, QShortcut, QColor, QBrush, QFont, QPalette, QTextCursor
     from PyQt6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout,
         QLabel, QLineEdit, QComboBox, QSplitter, QTreeWidget, QTreeWidgetItem,
-        QTextBrowser, QPushButton, QAbstractItemView, QMessageBox, QPlainTextEdit, QDialogButtonBox,
+        QTextBrowser, QPushButton, QAbstractItemView, QMessageBox, QPlainTextEdit, QDialogButtonBox, QInputDialog,
         QStyledItemDelegate, QStyleOptionViewItem, QStyle, QFileDialog, QWidget, QTextEdit)
 
     class ShapeView(QPlainTextEdit):
@@ -1561,6 +1561,9 @@ def make_context_window(owner, read_only=False):
             self.order = QComboBox(); self.order.addItems(["Chronological", "Newest first", "Largest first", "Older + larger", "Newer + larger"])
             self.order.setToolTip("Combined orders add time rank and Input KiB rank equally; lower total comes first, size breaks ties. Time is saved order. OFF rows retain their existing marker-size accounting. Type and text filters still apply.")
             bar.addWidget(self.order)
+            self.add_text_button = QPushButton("Add text…")
+            self.add_text_button.clicked.connect(self.add_text)
+            bar.addWidget(self.add_text_button)
             refresh = QPushButton("Refresh"); refresh.clicked.connect(lambda: self.reload())
             bar.addWidget(refresh); lower_layout.addLayout(bar)
             self.splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1623,6 +1626,21 @@ def make_context_window(owner, read_only=False):
             if previous.get('id') in self.nodes and not self.nodes[previous['id']].isHidden():
                 self.tree.setCurrentItem(self.nodes[previous['id']])
                 self.tree.verticalScrollBar().setValue(previous.get('scroll', 0))
+
+        def add_text(self):
+            if self.read_only or self._deleting or getattr(self.owner, 'busy', False):
+                return
+            dialog = QInputDialog(self)
+            dialog.setWindowTitle("Add text")
+            dialog.setLabelText("Paste or type a message:")
+            dialog.setOption(QInputDialog.InputDialogOption.UsePlainTextEditForTextInput)
+            dialog.setOkButtonText("Add")
+            dialog.resize(800, 500)
+            if dialog.exec() == QDialog.DialogCode.Accepted and dialog.textValue().strip():
+                self.owner.say(dialog.textValue())
+                self.changed = True
+                self.reload()
+            dialog.deleteLater()
 
         def focus_search(self):
             self.search.setFocus()
@@ -1746,6 +1764,7 @@ def make_context_window(owner, read_only=False):
 
         def update_controls(self):
             allowed = not self.read_only and not self._deleting and not getattr(self.owner, 'busy', False)
+            self.add_text_button.setEnabled(allowed)
             for button in (self.off_checked_button, self.on_checked_button, self.mark_button,
                            self.unmark_button, self.delete_button):
                 button.setEnabled(allowed and bool(self.checked))
