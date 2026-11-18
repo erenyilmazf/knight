@@ -18,6 +18,7 @@ import getpass
 import importlib.util
 import json
 import os
+import platform
 import queue
 from functools import partial, wraps
 import hashlib
@@ -65,6 +66,7 @@ task:{task}
 action_number:{action_number}
 actions_remaining_after_this:{actions_remaining_after_this}
 effort:{effort}
+host:{host} | os:{os} | arch:{arch}
 cwd:{cwd}
 session:{session}
 input_prepared_at:{timestamp}
@@ -2492,6 +2494,7 @@ class App:
             action_number="-" if mode == "CHAT" else f"{self.pulse_total - remaining + 1}/{self.pulse_total}",
             actions_remaining_after_this=0 if mode == "CHAT" else remaining - 1,
             effort=s.config["effort"],
+            host=platform.node(), os=platform.system(), arch=platform.machine(),
             cwd=s.state["cwd"], session=str(s.path), timestamp=stamp or now(),
         ) + "\nTo view an image, make Bash output only its absolute PNG, JPEG or WebP path. Images appear for one completed response; saved copies remain.", "developer")
 

@@ -2,7 +2,7 @@
 
 Prepared from the running InventionLab code on 11 November 2026.
 
-Current `knight.py` SHA-256: `dd1864d7dede0928bd985729491e92f0731bb1ac5a831464061836b72b15ee0f`
+Current `knight.py` SHA-256: `70dd444c382770248fbeacb741722ab6cb29478d3e5620decd6cb61f06c629db`
 
 Export adjustments: checkout-relative Wire/voice helper paths, a shared
 `KNIGHT_HOME` data directory, automatic Git pushes off by default, and the
@@ -39,3 +39,5 @@ record conversion removed from ordinary reads/saves. Removed the extra composer,
 slash-command parser and captured-request comparison window. F6 opens context,
 F7 loads files, and F8 switches between text and actual Python (app/session).
 Existing F2/F3/F4/F5 controls, time cues and selection-size measurements remain.
+
+19 November: HUD reports live hostname, operating system and architecture.
