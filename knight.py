@@ -1676,7 +1676,7 @@ def make_context_window(owner, read_only=False):
                 with (self.owner.session.path / 'context_edges.tsv').open(encoding='utf-8', newline='') as file:
                     sources = {int(row['source_entry']) for row in csv.DictReader(file, delimiter='\t')
                                if int(row['target_entry']) == ident}
-            except (OSError, ValueError, KeyError, csv.Error) as error:
+            except (OSError, ValueError, TypeError, KeyError, csv.Error) as error:
                 self.input_target, self.input_sources = None, set()
                 self.populate(anchor=ident)
                 self.input_status.setText(f"Cannot read recorded input: {error}")
