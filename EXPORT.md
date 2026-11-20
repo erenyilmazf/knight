@@ -2,7 +2,7 @@
 
 Prepared from the running InventionLab code on 11 November 2026.
 
-Current `knight.py` SHA-256: `d8866edcf3014a8306c3080c98c13647ef73ae5e131fcece7170d3daa5e30719`
+Current `knight.py` SHA-256: `70dd444c382770248fbeacb741722ab6cb29478d3e5620decd6cb61f06c629db`
 
 Export adjustments: checkout-relative Wire/voice helper paths, a shared
 `KNIGHT_HOME` data directory, automatic Git pushes off by default, and the
@@ -41,6 +41,3 @@ F7 loads files, and F8 switches between text and actual Python (app/session).
 Existing F2/F3/F4/F5 controls, time cues and selection-size measurements remain.
 
 19 November: HUD reports live hostname, operating system and architecture.
-
-19 November: context window shows a selected reply’s recorded input entries,
-with Then/Now columns, filtering and return to the reply. Uses the existing TSV.

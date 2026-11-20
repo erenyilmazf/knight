@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import base64
 import copy
-import csv
 from datetime import datetime
 import fcntl
 import getpass
@@ -1503,7 +1502,6 @@ def make_context_window(owner, read_only=False):
             self.owner, self.read_only = owner, read_only
             self.ident = owner.session.state['id']
             self.checked = set()
-            self.input_target, self.input_sources = None, set()
             previous = getattr(owner, '_context_place', {})
             self.shape_height = previous.get('shape_height', 200)
             self.expanded = {n: set(parts) for n, parts in previous.get('expanded', {}).items()}
@@ -1570,23 +1568,9 @@ def make_context_window(owner, read_only=False):
             bar.addWidget(self.add_text_button)
             refresh = QPushButton("Refresh"); refresh.clicked.connect(lambda: self.reload())
             bar.addWidget(refresh); lower_layout.addLayout(bar)
-            input_bar = QHBoxLayout()
-            self.input_button = QPushButton("Show its input")
-            self.input_button.clicked.connect(self.show_input)
-            self.input_back = QPushButton("Back to answer")
-            self.input_back.clicked.connect(self.clear_input)
-            self.input_only = QPushButton("Only included")
-            self.input_only.setCheckable(True); self.input_only.setChecked(True)
-            self.input_only.toggled.connect(self.apply_filter)
-            self.input_status = QLabel(); self.input_status.setWordWrap(True)
-            self.input_status.setToolTip("Recorded entry IDs, not an exact old request. The reader shows saved text now; earlier edits remain in Git.")
-            for widget in (self.input_button, self.input_back, self.input_only, self.input_status):
-                input_bar.addWidget(widget)
-            input_bar.setStretch(3, 1); lower_layout.addLayout(input_bar)
-            self.input_back.hide(); self.input_only.hide()
             self.splitter = QSplitter(Qt.Orientation.Horizontal)
-            self.tree = QTreeWidget(); self.tree.setColumnCount(8)
-            self.tree.setHeaderLabels(["✓", "Time", "API", "Type", "Input KiB", "Then", "Now", "Preview"])
+            self.tree = QTreeWidget(); self.tree.setColumnCount(6)
+            self.tree.setHeaderLabels(["✓", "Time", "API", "Type", "Input KiB", "Preview"])
             self.tree.setRootIsDecorated(False); self.tree.setAlternatingRowColors(True)
             self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
             self.tree.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -1594,13 +1578,9 @@ def make_context_window(owner, read_only=False):
             self.normal_tree_font = QFont(self.tree.font())
             self.item_delegate = ContextItemDelegate(self)
             self.tree.setItemDelegate(self.item_delegate)
-            for i, width in enumerate((30, 120, 55, 85, 82, 52, 52, 310)):
+            for i, width in enumerate((30, 120, 55, 85, 82, 310)):
                 self.tree.setColumnWidth(i, width)
             self.tree.header().setStretchLastSection(True)
-            self.tree.setColumnHidden(5, True); self.tree.setColumnHidden(6, True)
-            self.tree.headerItem().setToolTip(0, "Checked for an operation; this is not an ON/OFF switch.")
-            self.tree.headerItem().setToolTip(5, "Was this entry in the pinned answer's recorded input?")
-            self.tree.headerItem().setToolTip(6, "Current context switch; changing it does not change Then.")
             self.input_bar_help = "Bars show positive input-byte changes on a linear scale against the largest positive value in the full list, even when filtered or sorted. OFF/deletion rows show marker effects only, without an included-text bar. Negative values are kept. 1 KiB = 1,024 bytes; not tokens or saved-file size. Rows are not additive."
             self.tree.headerItem().setToolTip(4, self.input_bar_help)
             self.reader = QTextBrowser(); self.reader.setOpenLinks(False); self.reader.setOpenExternalLinks(False)
@@ -1645,10 +1625,6 @@ def make_context_window(owner, read_only=False):
             self.dense_toggle.toggled.connect(self.toggle_dense)
             self.dense_toggle.setChecked(previous.get('dense', False))
             previous = getattr(owner, '_context_place', {})
-            if previous.get('input_target') in self.nodes:
-                self.tree.setCurrentItem(self.nodes[previous['input_target']])
-                self.show_input()
-                self.input_only.setChecked(previous.get('input_only', True))
             if previous.get('id') in self.nodes and not self.nodes[previous['id']].isHidden():
                 self.tree.setCurrentItem(self.nodes[previous['id']])
                 self.tree.verticalScrollBar().setValue(previous.get('scroll', 0))
@@ -1667,44 +1643,6 @@ def make_context_window(owner, read_only=False):
                 self.changed = True
                 self.reload()
             dialog.deleteLater()
-
-        def show_input(self):
-            ident = getattr(self, 'current_id', None)
-            if self.groups.get(ident, {}).get('kind') != 'request':
-                return
-            try:
-                with (self.owner.session.path / 'context_edges.tsv').open(encoding='utf-8', newline='') as file:
-                    sources = {int(row['source_entry']) for row in csv.DictReader(file, delimiter='\t')
-                               if int(row['target_entry']) == ident}
-            except (OSError, ValueError, TypeError, KeyError, csv.Error) as error:
-                self.input_target, self.input_sources = None, set()
-                self.populate(anchor=ident)
-                self.input_status.setText(f"Cannot read recorded input: {error}")
-                return
-            if not sources:
-                self.input_target, self.input_sources = None, set()
-                self.populate(anchor=ident)
-                self.input_status.setText(f"No recorded input for group {ident}.")
-                return
-            self.input_target, self.input_sources = ident, sources
-            self.search.clear(); self.kind.setCurrentIndex(0)
-            self.populate()
-
-        def clear_input(self):
-            target = self.input_target
-            self.input_target, self.input_sources = None, set()
-            self.populate()
-            if target in self.nodes:
-                self.select_shape_group(target)
-
-        def input_mark(self, ident):
-            if self.input_target is None:
-                return ''
-            if ident == self.input_target:
-                return 'answer'
-            if ident in self.input_sources:
-                return 'yes'
-            return 'no' if ident < self.input_target else 'later'
 
         def focus_search(self):
             self.search.setFocus()
@@ -1783,7 +1721,7 @@ def make_context_window(owner, read_only=False):
             current = next((g for g in state['groups'] if g['id'] == ident), None)
             if (list(self.groups) != [g['id'] for g in state['groups']]
                     or current is None or payload_bytes(current) != self.fingerprints.get(ident)
-                    or payload_bytes(state.get('off_groups', [])) != self.inclusion_fingerprint):
+                    or payload_bytes([state.get('memories', []), state.get('off_groups', [])]) != self.inclusion_fingerprint):
                 # Resolve the ID from the displayed snapshot before refreshing.
                 self.reload()
             if ident not in self.nodes:
@@ -1796,9 +1734,6 @@ def make_context_window(owner, read_only=False):
             query = self.search.text().casefold().strip()
             if query and query not in self.terms[ident] and query != str(ident):
                 self.search.clear()
-            if (self.input_target is not None and ident != self.input_target
-                    and (ident > self.input_target or (self.input_only.isChecked() and ident not in self.input_sources))):
-                self.clear_input()
             node = self.nodes[ident]
             self.tree.clearSelection()
             self.tree.setCurrentItem(node)
@@ -1913,14 +1848,6 @@ def make_context_window(owner, read_only=False):
                 self.reader.verticalScrollBar().setValue(reading_scroll)
 
         def populate(self, anchor=None, scroll=None):
-            pinned = self.input_target is not None
-            for column in (5, 6): self.tree.setColumnHidden(column, not pinned)
-            self.input_back.setVisible(pinned); self.input_only.setVisible(pinned)
-            if pinned:
-                missing = len(self.input_sources - self.groups.keys())
-                self.input_status.setText(f"Input to group {self.input_target} · {len(self.input_sources)} entries · {missing} no longer saved")
-            else:
-                self.input_status.clear()
             current = self.tree.currentItem()
             highlighted = {i.data(0, Qt.ItemDataRole.UserRole) for i in self.tree.selectedItems()} if self.tree.topLevelItemCount() else None
             if anchor is None and current:
@@ -1945,16 +1872,16 @@ def make_context_window(owner, read_only=False):
                 g, r = self.groups[n], self.rows[n]
                 preview = ("* " if g.get("marked") else "") + context_reading_preview(g, self.parts[n])
                 stamp = (g.get('time') or '?')[:16].replace('T', ' ')
-                item = QTreeWidgetItem(["", stamp, context_call_number(g), names.get(g['kind'], g['kind']), f"{r['input_delta_bytes']/1024:,.1f}", self.input_mark(n), "ON" if r['context_active'] else "OFF", preview])
+                item = QTreeWidgetItem(["", stamp, context_call_number(g), names.get(g['kind'], g['kind']), f"{r['input_delta_bytes']/1024:,.1f}", preview])
                 item.setData(0, Qt.ItemDataRole.UserRole, n)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(0, Qt.CheckState.Checked if n in self.checked else Qt.CheckState.Unchecked)
                 item.setToolTip(4, f"Input change: {r['input_delta_bytes']:,} bytes\nSaved entry: {r['record_bytes']:,} bytes\n{self.input_bar_help}")
-                item.setToolTip(7, f"Group {n}\n{preview}")
+                item.setToolTip(5, f"Group {n}\n{preview}")
                 if not r['context_active']:
                     item.setText(3, names.get(g['kind'], g['kind']) + ' OFF')
                 if not r['context_active']:
-                    for column in range(8):
+                    for column in range(6):
                         item.setForeground(column, QColor('#888888'))
                 self.tree.addTopLevelItem(item); self.nodes[n] = item
             self.tree.blockSignals(False); self._updating = False
@@ -1974,9 +1901,6 @@ def make_context_window(owner, read_only=False):
                 show = ((allowed is None or self.groups[n]['kind'] in allowed)
                         and (self.kind.currentIndex() != 6 or self.groups[n].get('marked'))
                         and (not query or query in self.terms[n] or query == str(n)))
-                if self.input_target is not None:
-                    show = show and (n in self.input_sources if self.input_only.isChecked()
-                                     else n < self.input_target)
                 item.setHidden(not show)
                 if show:
                     visible.append(item)
@@ -1989,8 +1913,6 @@ def make_context_window(owner, read_only=False):
         def show_entry(self, item):
             if self._updating:
                 return
-            ident = item.data(0, Qt.ItemDataRole.UserRole) if item else None
-            self.input_button.setEnabled(self.groups.get(ident, {}).get('kind') == 'request')
             if item is None:
                 self.current_id = None
                 self.reader_key = None
@@ -2016,8 +1938,6 @@ def make_context_window(owner, read_only=False):
             heading += f" · Input change: {r['input_delta_bytes']/1024:,.1f} KiB"
             if not r['context_active']:
                 heading += " · OFF"
-            if self.input_target is not None:
-                heading += f" · In input to {self.input_target}: {self.input_mark(n)} · Now {'ON' if r['context_active'] else 'OFF'}"
             chunks.append(f"<p>{esc(heading)}</p>")
             for index, (title, text, folded) in enumerate(self.parts[n]):
                 editable = self.targets[n][index] is not None and not self.read_only
@@ -2269,7 +2189,6 @@ def make_context_window(owner, read_only=False):
                                          'shape_mode': self.shape_mode.currentText(),
                                          'shape_height': self.vertical_splitter.sizes()[0] if self.shape_toggle.isChecked() else self.shape_height,
                                          'dense': self.dense_toggle.isChecked(),
-                                         'input_target': self.input_target, 'input_only': self.input_only.isChecked(),
                                          'expanded': {n: set(parts) for n, parts in self.expanded.items()
                                                       if n in self.groups}}
             super().done(result)
