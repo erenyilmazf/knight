@@ -736,6 +736,8 @@ def group_items(group):
     if text is not None:
         return [input_message(text, "developer")]
     items = copy.deepcopy(group["items"])
+    if group.get("error") and not any(group["error"] in visible_text(item) for item in items):
+        items.append(input_message("Recorded error:\n" + group["error"]))
     if group.get("kind") == "request" and group.get("received_at"):
         items.insert(0, input_message(f"[Response received {group['received_at']}]", "developer"))
     notice = manual_edit_notice(group)
@@ -990,9 +992,11 @@ class Session:
                         "type": "function_call_output", "call_id": item["call_id"],
                         "output": "UNKNOWN: interrupted before outcome was saved. Inspect current state; do not replay blindly.",
                     })
+        message = "Recovered interrupted session without replaying an action."
+        group["items"].append(input_message(message))
         self.state["pending"] = None
         self.save()
-        print("Recovered interrupted session without replaying an action.")
+        print(message)
 
     def close(self):
         self.lock.close()
@@ -2787,8 +2791,10 @@ class App:
                         s.state["viewed_images"] = sorted(set(s.state.get("viewed_images", [])) | set(image_calls))
                 else:
                     group["partial_output"] = without_reasoning(output)
-                    group["items"].append(input_message(
-                        "[Previous response incomplete or failed; no commands executed. Partial output is saved in this group.]"))
+                    message = "[Previous response incomplete or failed; no commands executed. Partial output is saved in this group.]\n"
+                    message += json.dumps({key: final.get(key) for key in ("status", "error", "incomplete_details")}, ensure_ascii=False)
+                    group["items"].append(input_message(message))
+                    print(message, flush=True)
                 s.state["pending"] = {"stage": "response", "group": group["id"]}
                 s.save()
             text = "\n".join(visible_text(item) for item in output if item.get("type") == "message")
@@ -2841,10 +2847,13 @@ class App:
             return keep_going and not self.pause
         except (APIError, ValueError, OSError, EOFError, KeyboardInterrupt) as error:
             message = "Interrupted locally" if isinstance(error, KeyboardInterrupt) else str(error)
-            print(f"\n{message}\nback in text; no automatic retry.")
+            text = f"{message}\nback in text; no automatic retry."
+            print("\n" + text)
             with s.state_lock:
-                if group is not None:
-                    group["error"] = message
+                if group is None:
+                    group = s.group("notice", [])
+                group["error"] = message
+                group["items"].append(input_message(text))
                 s.recover_pending()
                 s.save()
             return False
