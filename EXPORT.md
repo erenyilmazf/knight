@@ -2,7 +2,7 @@
 
 Prepared from the running InventionLab code on 11 November 2026.
 
-Current `knight.py` SHA-256: `8e8d90d43c2d4b7a676e0554ca48dcd0b91d22668f83c5c67318d04287e71adb`
+Current `knight.py` SHA-256: `2a5cc622c4512285d5cbd5d5f200b53cda8ed393840d18cb7a8ae4a85a7bcb6a`
 
 Export adjustments: checkout-relative Wire/voice helper paths, a shared
 `KNIGHT_HOME` data directory, automatic Git pushes off by default, and the
@@ -43,3 +43,5 @@ Existing F2/F3/F4/F5 controls, time cues and selection-size measurements remain.
 19 November: HUD reports live hostname, operating system and architecture.
 
 20 November: printed call failures and recovery messages enter saved context; earlier recorded errors and failed-response reasons are included when their entry is ON.
+
+22 November: F6 can name checked entries individually. Names do not change switches or model input.

@@ -848,6 +848,8 @@ class Session:
             for group in groups:
                 if group["id"] in ids:
                     group["marked"] = True
+                    if memory.get("name"):
+                        group.setdefault("label", memory["name"])
             off = off - ids if memory["active"] else off | ids
         self.state["off_groups"] = sorted(off)
         self.recover_pending()
@@ -1600,6 +1602,9 @@ def make_context_window(owner, read_only=False):
             self.mark_button.clicked.connect(lambda: self.mark_checked(True))
             self.unmark_button.clicked.connect(lambda: self.mark_checked(False))
             bottom.addWidget(self.mark_button); bottom.addWidget(self.unmark_button)
+            self.name_button = QPushButton("Name checked…")
+            self.name_button.clicked.connect(self.name_checked)
+            bottom.addWidget(self.name_button)
             self.footer = QLabel(); self.footer.setWordWrap(True); bottom.addWidget(self.footer, 1)
             self.off_checked_button = QPushButton("Turn off checked")
             self.on_checked_button = QPushButton("Turn on checked")
@@ -1772,7 +1777,7 @@ def make_context_window(owner, read_only=False):
             allowed = not self.read_only and not self._deleting and not getattr(self.owner, 'busy', False)
             self.add_text_button.setEnabled(allowed)
             for button in (self.off_checked_button, self.on_checked_button, self.mark_button,
-                           self.unmark_button, self.delete_button):
+                           self.unmark_button, self.name_button, self.delete_button):
                 button.setEnabled(allowed and bool(self.checked))
 
         def set_checked_active(self, active):
@@ -1780,6 +1785,13 @@ def make_context_window(owner, read_only=False):
             expected = {n: self.fingerprints[n] for n in ids}
             return self.change_context(lambda: self.owner.set_context_active(
                 ids, active, expected=expected, expected_switches=self.inclusion_fingerprint, push=False))
+
+        def name_checked(self):
+            names = {self.groups[n].get('label', '') for n in self.checked}
+            name, ok = QInputDialog.getText(self, "Name checked entries", "Name (leave blank to clear):",
+                                            text=names.pop() if len(names) == 1 else '')
+            if ok:
+                self.change_context(lambda: self.owner.name_entries(self.checked, name))
 
         def mark_checked(self, marked):
             return self.change_context(lambda: self.owner.set_marked(list(self.checked), marked))
@@ -1842,7 +1854,8 @@ def make_context_window(owner, read_only=False):
             detail = {g['id']: context_sections(g, with_targets=True) for g in groups}
             self.parts = {n: [row[:3] for row in rows] for n, rows in detail.items()}
             self.targets = {n: [row[3] for row in rows] for n, rows in detail.items()}
-            self.terms = {n: "\n".join(t for _, t, _ in parts).casefold() for n, parts in self.parts.items()}
+            self.terms = {n: (self.groups[n].get('label', '') + "\n" + "\n".join(t for _, t, _ in parts)).casefold()
+                          for n, parts in self.parts.items()}
             self.checked.intersection_update(self.groups)
             self.populate(anchor, scroll)
             for n in highlighted:
@@ -1874,7 +1887,11 @@ def make_context_window(owner, read_only=False):
             names = {"request": "Run", "human": "Human", "human-file": "Human", "peer": "Wire", "reference": "Loaded text", "gap": "Gap", "deletion": "Receipt"}
             for n in ids:
                 g, r = self.groups[n], self.rows[n]
-                preview = ("* " if g.get("marked") else "") + context_reading_preview(g, self.parts[n])
+                preview = context_reading_preview(g, self.parts[n])
+                if g.get('label'):
+                    preview = g['label'] + ' · ' + preview
+                if g.get('marked'):
+                    preview = '* ' + preview
                 stamp = (g.get('time') or '?')[:16].replace('T', ' ')
                 item = QTreeWidgetItem(["", stamp, context_call_number(g), names.get(g['kind'], g['kind']), f"{r['input_delta_bytes']/1024:,.1f}", preview])
                 item.setData(0, Qt.ItemDataRole.UserRole, n)
@@ -1942,6 +1959,8 @@ def make_context_window(owner, read_only=False):
             heading += f" · Input change: {r['input_delta_bytes']/1024:,.1f} KiB"
             if not r['context_active']:
                 heading += " · OFF"
+            if g.get('label'):
+                heading += " · " + g['label']
             chunks.append(f"<p>{esc(heading)}</p>")
             for index, (title, text, folded) in enumerate(self.parts[n]):
                 editable = self.targets[n][index] is not None and not self.read_only
@@ -2953,27 +2972,35 @@ class App:
         self._save_switches(updated, 'context ' + label, push)
         return True
 
-    @with_state_lock
     def set_marked(self, ids, marked=True):
+        if type(marked) is not bool:
+            raise ValueError("Use True or False")
+        return self._set_entry_note(ids, 'marked', marked, 'mark entries' if marked else 'unmark entries')
+
+    def name_entries(self, ids, name):
+        return self._set_entry_note(ids, 'label', name.strip(), 'name entries')
+
+    @with_state_lock
+    def _set_entry_note(self, ids, field, value, event):
         s = self.session
         if self.busy or s.state.get('pending'):
             raise ValueError("Wait for the current call to finish")
         selected = set(ids)
         groups = [dict(g) for g in s.state['groups']]
-        if type(marked) is not bool or not selected or not selected <= {g['id'] for g in groups}:
-            raise ValueError("Choose existing entries and True or False")
+        if not selected or not selected <= {g['id'] for g in groups}:
+            raise ValueError("Choose existing entries")
         changed = False
         for group in groups:
-            if group['id'] in selected and bool(group.get('marked')) != marked:
+            if group['id'] in selected and group.get(field) != (value or None):
                 changed = True
-                if marked:
-                    group['marked'] = True
+                if value:
+                    group[field] = value
                 else:
-                    group.pop('marked', None)
+                    group.pop(field, None)
         if changed:
             s.state['groups'] = groups
             s.save()
-            self.record_git('mark entries' if marked else 'unmark entries')
+            self.record_git(event)
         return changed
 
     @with_state_lock
