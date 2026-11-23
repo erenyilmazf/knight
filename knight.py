@@ -643,6 +643,8 @@ def context_rows(state, state_path):
     deltas = context_group_deltas(state["groups"], cache_mode, state.get("off_groups", []), state.get("context_changes", {}).get("on", []), state.get("context_changes", {}).get("off", []), state.get("viewed_images", []))
     off = set(state.get("off_groups", []))
     for index, group in enumerate(state["groups"]):
+        reasoning = [item for item in group["items"] if item.get("type") == "reasoning"]
+        reasoning_bytes = len(payload_bytes(reasoning)) if reasoning and group['id'] not in off else 0
         current = payload_bytes(group)
         if checkpoint is None:
             head = "?"
@@ -658,6 +660,8 @@ def context_rows(state, state_path):
             "time": group.get("time"),
             "call": group.get("call"),
             "input_delta_bytes": deltas[index],
+            "content_delta_bytes": deltas[index] - reasoning_bytes,
+            "reasoning_bytes": reasoning_bytes,
             "record_bytes": len(current),
             "raw_output_bytes": len(group.get("raw_output", "").encode("utf-8")),
             "git_head": head,
@@ -1479,7 +1483,7 @@ def make_context_window(owner, read_only=False):
                 return super().paint(painter, option, index)
             n = index.siblingAtColumn(0).data(Qt.ItemDataRole.UserRole)
             row = self.window.rows[n]
-            value = row['input_delta_bytes']
+            value = row['content_delta_bytes']
             if (value <= 0 or self.maximum <= 0 or not row['context_active']
                     or deletion_text(self.window.groups[n]) is not None):
                 return super().paint(painter, option, index)
@@ -1567,7 +1571,7 @@ def make_context_window(owner, read_only=False):
             self.kind = QComboBox(); self.kind.addItems(["All entries", "Human", "Runs", "Wire", "Loaded text", "Deletion markers", "Marked *"])
             bar.addWidget(self.kind)
             self.order = QComboBox(); self.order.addItems(["Chronological", "Newest first", "Largest first", "Older + larger", "Newer + larger"])
-            self.order.setToolTip("Combined orders add time rank and Input KiB rank equally; lower total comes first, size breaks ties. Time is saved order. OFF rows retain their existing marker-size accounting. Type and text filters still apply.")
+            self.order.setToolTip("Combined orders add time rank and Content KiB rank equally; lower total comes first, size breaks ties. Time is saved order. OFF rows retain their existing marker-size accounting. Type and text filters still apply.")
             bar.addWidget(self.order)
             self.add_text_button = QPushButton("Add text…")
             self.add_text_button.clicked.connect(self.add_text)
@@ -1575,8 +1579,8 @@ def make_context_window(owner, read_only=False):
             refresh = QPushButton("Refresh"); refresh.clicked.connect(lambda: self.reload())
             bar.addWidget(refresh); lower_layout.addLayout(bar)
             self.splitter = QSplitter(Qt.Orientation.Horizontal)
-            self.tree = QTreeWidget(); self.tree.setColumnCount(6)
-            self.tree.setHeaderLabels(["✓", "Time", "API", "Type", "Input KiB", "Preview"])
+            self.tree = QTreeWidget(); self.tree.setColumnCount(7)
+            self.tree.setHeaderLabels(["✓", "Time", "API", "Type", "Content KiB", "Reasoning KiB", "Preview"])
             self.tree.setRootIsDecorated(False); self.tree.setAlternatingRowColors(True)
             self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
             self.tree.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -1584,11 +1588,12 @@ def make_context_window(owner, read_only=False):
             self.normal_tree_font = QFont(self.tree.font())
             self.item_delegate = ContextItemDelegate(self)
             self.tree.setItemDelegate(self.item_delegate)
-            for i, width in enumerate((30, 120, 55, 85, 82, 310)):
+            for i, width in enumerate((30, 120, 55, 85, 90, 100, 202)):
                 self.tree.setColumnWidth(i, width)
             self.tree.header().setStretchLastSection(True)
-            self.input_bar_help = "Bars show positive input-byte changes on a linear scale against the largest positive value in the full list, even when filtered or sorted. OFF/deletion rows show marker effects only, without an included-text bar. Negative values are kept. 1 KiB = 1,024 bytes; not tokens or saved-file size. Rows are not additive."
+            self.input_bar_help = "Bars and size sorting exclude opaque reasoning. Content includes messages, commands, results and active images. These are serialized request bytes, not tokens. OFF/deletion rows show marker effects; rows are not additive."
             self.tree.headerItem().setToolTip(4, self.input_bar_help)
+            self.tree.headerItem().setToolTip(5, "Included reasoning JSON bytes, not rendered tokens. With current_turn, earlier-turn reasoning is not rendered. Saved reasoning is unchanged.")
             self.reader = QTextBrowser(); self.reader.setOpenLinks(False); self.reader.setOpenExternalLinks(False)
             self.reader.setMinimumWidth(330)
             self.splitter.addWidget(self.tree); self.splitter.addWidget(self.reader)
@@ -1605,7 +1610,7 @@ def make_context_window(owner, read_only=False):
             self.name_button = QPushButton("Name checked…")
             self.name_button.clicked.connect(self.name_checked)
             bottom.addWidget(self.name_button)
-            self.footer = QLabel(); self.footer.setWordWrap(True); bottom.addWidget(self.footer, 1)
+            self.footer = QLabel(); self.footer.setWordWrap(True)
             self.off_checked_button = QPushButton("Turn off checked")
             self.on_checked_button = QPushButton("Turn on checked")
             for button, active in ((self.off_checked_button, False), (self.on_checked_button, True)):
@@ -1616,6 +1621,7 @@ def make_context_window(owner, read_only=False):
             bottom.addWidget(self.delete_button)
             close = QPushButton("Close"); close.clicked.connect(self.close); bottom.addWidget(close)
             layout.addLayout(bottom)
+            layout.addWidget(self.footer)
             self.tree.currentItemChanged.connect(lambda current, previous: self.show_entry(current))
             self.tree.itemClicked.connect(lambda item, column: self.shape_view.highlight_group(
                 item.data(0, Qt.ItemDataRole.UserRole), reveal=True))
@@ -1850,7 +1856,7 @@ def make_context_window(owner, read_only=False):
             self.fingerprints = {g['id']: payload_bytes(g) for g in groups}
             self.positions = {g['id']: i for i, g in enumerate(groups)}
             self.rows = {r['id']: r for r in context_rows(snapshot, self.owner.session.state_path)}
-            self.item_delegate.maximum = max((max(0, r['input_delta_bytes']) for r in self.rows.values()), default=0)
+            self.item_delegate.maximum = max((max(0, r['content_delta_bytes']) for r in self.rows.values()), default=0)
             detail = {g['id']: context_sections(g, with_targets=True) for g in groups}
             self.parts = {n: [row[:3] for row in rows] for n, rows in detail.items()}
             self.targets = {n: [row[3] for row in rows] for n, rows in detail.items()}
@@ -1876,11 +1882,11 @@ def make_context_window(owner, read_only=False):
             if order in (1, 4):
                 ids.reverse()
             if order == 2:
-                ids.sort(key=lambda n: self.rows[n]['input_delta_bytes'], reverse=True)
+                ids.sort(key=lambda n: self.rows[n]['content_delta_bytes'], reverse=True)
             elif order in (3, 4):
                 time_rank = {n: rank for rank, n in enumerate(ids)}
                 size_rank = {n: rank for rank, n in enumerate(sorted(
-                    ids, key=lambda n: self.rows[n]['input_delta_bytes'], reverse=True))}
+                    ids, key=lambda n: self.rows[n]['content_delta_bytes'], reverse=True))}
                 ids.sort(key=lambda n: (time_rank[n] + size_rank[n], size_rank[n]))
             self._updating = True; self.tree.blockSignals(True)
             self.tree.clear(); self.nodes = {}
@@ -1893,16 +1899,17 @@ def make_context_window(owner, read_only=False):
                 if g.get('marked'):
                     preview = '* ' + preview
                 stamp = (g.get('time') or '?')[:16].replace('T', ' ')
-                item = QTreeWidgetItem(["", stamp, context_call_number(g), names.get(g['kind'], g['kind']), f"{r['input_delta_bytes']/1024:,.1f}", preview])
+                item = QTreeWidgetItem(["", stamp, context_call_number(g), names.get(g['kind'], g['kind']), f"{r['content_delta_bytes']/1024:,.1f}", f"{r['reasoning_bytes']/1024:,.1f}", preview])
                 item.setData(0, Qt.ItemDataRole.UserRole, n)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(0, Qt.CheckState.Checked if n in self.checked else Qt.CheckState.Unchecked)
                 item.setToolTip(4, f"Input change: {r['input_delta_bytes']:,} bytes\nSaved entry: {r['record_bytes']:,} bytes\n{self.input_bar_help}")
-                item.setToolTip(5, f"Group {n}\n{preview}")
+                item.setToolTip(5, self.tree.headerItem().toolTip(5))
+                item.setToolTip(6, f"Group {n}\n{preview}")
                 if not r['context_active']:
                     item.setText(3, names.get(g['kind'], g['kind']) + ' OFF')
                 if not r['context_active']:
-                    for column in range(6):
+                    for column in range(7):
                         item.setForeground(column, QColor('#888888'))
                 self.tree.addTopLevelItem(item); self.nodes[n] = item
             self.tree.blockSignals(False); self._updating = False
@@ -1956,7 +1963,7 @@ def make_context_window(owner, read_only=False):
             chunks = ["<style>body{font-family:sans-serif;font-size:11pt;} pre{white-space:pre-wrap;font-family:monospace;} .body{white-space:pre-wrap;} h3{margin-bottom:6px;} a{text-decoration:none;}</style>"]
             call = context_call_number(g)
             heading = f"Group {n}" + (" *" if g.get("marked") else "") + (f" · API {call}" if call else "")
-            heading += f" · Input change: {r['input_delta_bytes']/1024:,.1f} KiB"
+            heading += f" · Content: {r['content_delta_bytes']/1024:,.1f} KiB · Reasoning: {r['reasoning_bytes']/1024:,.1f} KiB"
             if not r['context_active']:
                 heading += " · OFF"
             if g.get('label'):
@@ -2936,15 +2943,15 @@ class App:
         if json_output:
             print(json.dumps(rows, ensure_ascii=False, indent=2))
             return
-        print("   ID kind           time         call     inputΔ     record        raw HEAD flags            preview")
+        print("   ID kind           time         call   contentΔ  reasoning     record        raw HEAD flags            preview")
         for row in rows:
             timestamp = (row["time"] or "?")[:16].replace("T", " ")
             call = "-" if row["call"] is None else str(row["call"])
             flags = ",".join(row["flags"]) or "-"
             print(f"{row['id']:5d} {row['kind'][:14]:14s} {timestamp:16s} "
-                  f"{call:>5s} {row['input_delta_bytes']:10,d} {row['record_bytes']:10,d} "
+                  f"{call:>5s} {row['content_delta_bytes']:10,d} {row['reasoning_bytes']:10,d} {row['record_bytes']:10,d} "
                   f"{row['raw_output_bytes']:10,d} {row['git_head']:>4s} {flags[:16]:16s} {row['preview']}")
-        print("inputΔ=request bytes removed including next-header rebasing, before gap replacement/merging; rows are not additive; record=compact saved group; "
+        print("contentΔ=request byte change excluding opaque reasoning; reasoning=included opaque JSON bytes; neither is tokens; rows are not additive; record=compact saved group; "
               "raw=cold full tool output outside active items.")
         print("HEAD: yes=exact group in current Git HEAD, chg=same ID differs, new=ID absent, ?=no readable checkpoint. "
               "Flags are mechanical, not importance scores.")

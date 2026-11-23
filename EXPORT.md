@@ -2,7 +2,7 @@
 
 Prepared from the running InventionLab code on 11 November 2026.
 
-Current `knight.py` SHA-256: `2a5cc622c4512285d5cbd5d5f200b53cda8ed393840d18cb7a8ae4a85a7bcb6a`
+Current `knight.py` SHA-256: `9d6718f16a4e16f0b3bce76b497b997eeec685ddbe82dd90cb826dfa3d4c0123`
 
 Export adjustments: checkout-relative Wire/voice helper paths, a shared
 `KNIGHT_HOME` data directory, automatic Git pushes off by default, and the
@@ -45,3 +45,5 @@ Existing F2/F3/F4/F5 controls, time cues and selection-size measurements remain.
 20 November: printed call failures and recovery messages enter saved context; earlier recorded errors and failed-response reasons are included when their entry is ON.
 
 22 November: F6 can name checked entries individually. Names do not change switches or model input.
+
+23 November: F6 separates content and reasoning bytes; size sorting excludes reasoning. Status sits below the buttons. Request and saved content are unchanged.
