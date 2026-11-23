@@ -2,7 +2,7 @@
 
 Prepared from the running InventionLab code on 11 November 2026.
 
-Current `knight.py` SHA-256: `9d6718f16a4e16f0b3bce76b497b997eeec685ddbe82dd90cb826dfa3d4c0123`
+Current `knight.py` SHA-256: `2de48e6f2f2073381225e973d3c45f16a552477ec139f5df713c864e916b9042`
 
 Export adjustments: checkout-relative Wire/voice helper paths, a shared
 `KNIGHT_HOME` data directory, automatic Git pushes off by default, and the
@@ -46,4 +46,4 @@ Existing F2/F3/F4/F5 controls, time cues and selection-size measurements remain.
 
 22 November: F6 can name checked entries individually. Names do not change switches or model input.
 
-23 November: F6 separates content and reasoning bytes; size sorting excludes reasoning. Status sits below the buttons. Request and saved content are unchanged.
+23 November: F6 separates content and reasoning bytes; size sorting excludes reasoning. Buttons use two rows and status sits below them. Request and saved content are unchanged.

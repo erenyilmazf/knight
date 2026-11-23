@@ -1610,6 +1610,8 @@ def make_context_window(owner, read_only=False):
             self.name_button = QPushButton("Name checked…")
             self.name_button.clicked.connect(self.name_checked)
             bottom.addWidget(self.name_button)
+            layout.addLayout(bottom)
+            bottom = QHBoxLayout()
             self.footer = QLabel(); self.footer.setWordWrap(True)
             self.off_checked_button = QPushButton("Turn off checked")
             self.on_checked_button = QPushButton("Turn on checked")
