@@ -1974,6 +1974,8 @@ def make_context_window(owner, read_only=False):
             for index, (title, text, folded) in enumerate(self.parts[n]):
                 editable = self.targets[n][index] is not None and not self.read_only
                 edit_link = f' <a href="edit:{index}">Edit</a>' if editable else ''
+                if editable and title.split(' · ', 1)[0] in ('Command', 'Output'):
+                    edit_link += f' <a href="omit:{index}">Omit</a>'
                 if not text and not editable:
                     chunks.append(f"<p><i>{esc(title)}</i></p>"); continue
                 opened = not folded or index in expanded or (bool(query) and query in text.casefold())
@@ -2101,6 +2103,8 @@ def make_context_window(owner, read_only=False):
             value = url.toString()
             if value.startswith('edit:') and value[5:].isdigit():
                 self.edit_section(int(value[5:])); return
+            if value.startswith('omit:') and value[5:].isdigit():
+                return self.save_edit(int(value[5:]), '[human omission]')
             if not value.startswith('part:') or not value[5:].isdigit():
                 return
             n = getattr(self, 'current_id', None); index = int(value[5:])

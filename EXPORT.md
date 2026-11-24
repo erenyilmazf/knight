@@ -2,7 +2,7 @@
 
 Prepared from the running InventionLab code on 11 November 2026.
 
-Current `knight.py` SHA-256: `2de48e6f2f2073381225e973d3c45f16a552477ec139f5df713c864e916b9042`
+Current `knight.py` SHA-256: `921f22f7e0825d165a0262439a4ccd67b3e7916bd5116c7f6d638583cfc06979`
 
 Export adjustments: checkout-relative Wire/voice helper paths, a shared
 `KNIGHT_HOME` data directory, automatic Git pushes off by default, and the
