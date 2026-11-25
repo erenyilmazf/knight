@@ -1514,8 +1514,8 @@ def make_context_window(owner, read_only=False):
             style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
             rect = opt.rect.adjusted(3, 2, -3, -2)
             selected = bool(opt.state & QStyle.StateFlag.State_Selected)
-            color = QColor(opt.palette.highlightedText().color() if selected else opt.palette.highlight().color())
-            color.setAlpha(65)
+            color = self.window.tree.palette().color(QPalette.ColorGroup.Active, QPalette.ColorRole.HighlightedText if selected else QPalette.ColorRole.Highlight)
+            color.setAlpha(65 if selected else 140)
             if sizes:
                 middle = rect.center().x()
                 half = max(0, (rect.width() - 1) // 2)
