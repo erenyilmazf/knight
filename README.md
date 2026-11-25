@@ -84,8 +84,10 @@ older Git checkpoints.
 For the graphical context view, install `PyQt6` in the same Python environment.
 **Add text…** opens a multiline box for pasting or typing a message.
 **Add** saves it into context; F3 or F4 requests the next response.
-Check entries, then use **Turn off checked** or **Turn on checked** to change
-their inclusion. **Mark \*** and **Unmark** add or remove a bookmark, without
+Check entries, choose **Whole entry**, **Command** or **Output**, then click
+**Turn off checked** or **Turn on checked**. Command and Output switch only
+the selected field’s text in model input; the saved text remains readable and
+editable. The two field switches are independent. **Mark \*** and **Unmark** add or remove a bookmark, without
 changing inclusion. Choose **Marked \*** to find those entries. Old named
 bookmarks become independent marks on reopening, preserving their ON/OFF state.
 Without PyQt6 or a display, F6 shows a text table;

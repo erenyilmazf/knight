@@ -739,6 +739,10 @@ def group_items(group):
     text = deletion_text(group)
     if text is not None:
         return [input_message(text, "developer")]
+    for field in ("Command", "Output"):
+        if group.get(field.lower() + "_off"):
+            for path in switchable_paths(group, field):
+                group = replace_path_text(group, path, f"[{field} off]")
     items = copy.deepcopy(group["items"])
     if group.get("error") and not any(group["error"] in visible_text(item) for item in items):
         items.append(input_message("Recorded error:\n" + group["error"]))
@@ -1078,17 +1082,26 @@ def replace_editable_text(group, path, text):
                if target is not None}
     if path not in targets or not isinstance(text, str) or "\x00" in text:
         raise ValueError("Choose an editable text section")
-    def replace(value, remaining):
-        if not remaining:
-            return text
-        if isinstance(value, str):
-            data, opening, closing = edit_json(value)
-            return opening + json.dumps(replace(data, remaining), ensure_ascii=False) + closing
-        result = copy.deepcopy(value)
-        key, *tail = remaining
-        result[key] = replace(result[key], tail)
-        return result
-    return replace(group, path)
+    return replace_path_text(group, path, text)
+
+
+def replace_path_text(value, path, text):
+    if not path:
+        return text
+    if isinstance(value, str):
+        data, opening, closing = edit_json(value)
+        return opening + json.dumps(replace_path_text(data, path, text), ensure_ascii=False) + closing
+    result = value.copy()
+    key, *tail = path
+    result[key] = replace_path_text(value[key], tail, text)
+    return result
+
+
+def switchable_paths(group, field):
+    for title, _, _, path in context_sections(group, with_targets=True):
+        if path and path[0] == 'items' and title.partition(' · ')[0] == field:
+            if editable_text(group, path) != '[human omission]':
+                yield path
 
 
 def manual_edit_notice(group):
@@ -1613,11 +1626,15 @@ def make_context_window(owner, read_only=False):
             layout.addLayout(bottom)
             bottom = QHBoxLayout()
             self.footer = QLabel(); self.footer.setWordWrap(True)
+            self.switch_field = QComboBox()
+            self.switch_field.addItems(["Whole entry", "Command", "Output"])
+            self.switch_field.setToolTip("Switch whole entries or just their command or output text. Saved text is kept.")
+            bottom.addWidget(self.switch_field)
             self.off_checked_button = QPushButton("Turn off checked")
             self.on_checked_button = QPushButton("Turn on checked")
             for button, active in ((self.off_checked_button, False), (self.on_checked_button, True)):
                 button.clicked.connect(lambda checked=False, active=active: self.set_checked_active(active))
-                button.setToolTip("Switch only the checked entries.")
+                button.setToolTip("Apply the chosen switch only to checked entries.")
                 bottom.addWidget(button)
             self.delete_button = QPushButton("Delete checked"); self.delete_button.clicked.connect(lambda: self.delete_checked())
             bottom.addWidget(self.delete_button)
@@ -1792,7 +1809,8 @@ def make_context_window(owner, read_only=False):
             ids = sorted(self.checked, key=self.positions.get)
             expected = {n: self.fingerprints[n] for n in ids}
             return self.change_context(lambda: self.owner.set_context_active(
-                ids, active, expected=expected, expected_switches=self.inclusion_fingerprint, push=False))
+                ids, active, expected=expected, expected_switches=self.inclusion_fingerprint,
+                field=self.switch_field.currentText(), push=False))
 
         def name_checked(self):
             names = {self.groups[n].get('label', '') for n in self.checked}
@@ -1809,6 +1827,7 @@ def make_context_window(owner, read_only=False):
                 return False
             self._deleting = True
             self.setEnabled(False)
+            previous = self.owner.session.state
             try:
                 changed = action()
                 self.changed = self.changed or changed
@@ -1816,6 +1835,9 @@ def make_context_window(owner, read_only=False):
                 self.reload()
                 return changed
             except (Exception, KeyboardInterrupt) as error:
+                if self.owner.session.state is not previous:
+                    self.changed = True
+                    self.reload()
                 self.last_error = str(error) or 'Context change interrupted.'
                 self.footer.setText(self.last_error)
                 return False
@@ -1896,6 +1918,9 @@ def make_context_window(owner, read_only=False):
             for n in ids:
                 g, r = self.groups[n], self.rows[n]
                 preview = context_reading_preview(g, self.parts[n])
+                for field, badge in (('output_off', 'O:off'), ('command_off', 'C:off')):
+                    if g.get(field):
+                        preview = badge + ' ' + preview
                 if g.get('label'):
                     preview = g['label'] + ' · ' + preview
                 if g.get('marked'):
@@ -1974,8 +1999,8 @@ def make_context_window(owner, read_only=False):
             for index, (title, text, folded) in enumerate(self.parts[n]):
                 editable = self.targets[n][index] is not None and not self.read_only
                 edit_link = f' <a href="edit:{index}">Edit</a>' if editable else ''
-                if editable and title.split(' · ', 1)[0] in ('Command', 'Output'):
-                    edit_link += f' <a href="omit:{index}">Omit</a>'
+                if g.get(title.partition(' · ')[0].lower() + '_off'):
+                    title += ' · OFF in input (saved text below)'
                 if not text and not editable:
                     chunks.append(f"<p><i>{esc(title)}</i></p>"); continue
                 opened = not folded or index in expanded or (bool(query) and query in text.casefold())
@@ -2103,8 +2128,6 @@ def make_context_window(owner, read_only=False):
             value = url.toString()
             if value.startswith('edit:') and value[5:].isdigit():
                 self.edit_section(int(value[5:])); return
-            if value.startswith('omit:') and value[5:].isdigit():
-                return self.save_edit(int(value[5:]), '[human omission]')
             if not value.startswith('part:') or not value[5:].isdigit():
                 return
             n = getattr(self, 'current_id', None); index = int(value[5:])
@@ -2963,7 +2986,7 @@ class App:
               "Flags are mechanical, not importance scores.")
 
     @with_state_lock
-    def set_context_active(self, ids, active, expected=None, expected_switches=None, push=False):
+    def set_context_active(self, ids, active, expected=None, expected_switches=None, push=False, field="Whole entry"):
         s = self.session
         if self.busy or s.state.get('pending'):
             raise ValueError("Wait for the current call to finish")
@@ -2976,6 +2999,13 @@ class App:
             raise ValueError("Context switches changed; refresh")
         if expected is not None and any(expected.get(n) != payload_bytes(groups[n]) for n in selected):
             raise ValueError("Context changed; refresh")
+        if field != "Whole entry":
+            if field not in ("Command", "Output"):
+                raise ValueError("Choose Whole entry, Command or Output")
+            flag = field.lower() + '_off'
+            targets = [n for n in selected if groups[n].get(flag) or (not active and any(switchable_paths(groups[n], field)))]
+            event = f"{field} {'on' if active else 'off'} " + compact_group_ids(sorted(targets))
+            return bool(targets) and self._set_entry_note(targets, flag, not active, event, push)
         off = set(s.state.get('off_groups', []))
         updated = sorted(off - selected if active else off | selected)
         if updated == sorted(off):
@@ -2994,7 +3024,7 @@ class App:
         return self._set_entry_note(ids, 'label', name.strip(), 'name entries')
 
     @with_state_lock
-    def _set_entry_note(self, ids, field, value, event):
+    def _set_entry_note(self, ids, field, value, event, push=False):
         s = self.session
         if self.busy or s.state.get('pending'):
             raise ValueError("Wait for the current call to finish")
@@ -3011,9 +3041,15 @@ class App:
                 else:
                     group.pop(field, None)
         if changed:
-            s.state['groups'] = groups
-            s.save()
-            self.record_git(event)
+            previous = s.state
+            s.state = dict(previous, groups=groups)
+            try:
+                s.save()
+            except BaseException:
+                s.state = previous
+                raise
+            if not self.record_git(event, push=push):
+                raise ValueError("Change saved locally; Git sync is still due")
         return changed
 
     @with_state_lock
