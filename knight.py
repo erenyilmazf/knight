@@ -17,6 +17,7 @@ import fcntl
 import getpass
 import importlib.util
 import json
+import math
 import os
 import platform
 import queue
@@ -278,8 +279,7 @@ class API:
         """Read the complete response, including its opaque reasoning items."""
         with self.open("/responses", dict(body, stream=True)) as response:
             if "text/event-stream" not in response.headers.get("Content-Type", ""):
-                result = json.load(response)
-                return result
+                return json.load(response)
             parts = []
             for raw in response:
                 line = raw.decode("utf-8").rstrip("\r\n")
@@ -1112,7 +1112,7 @@ def manual_edit_notice(group):
     return "[Human-edited: " + "; ".join(parts) + "]" if parts else ""
 
 
-def context_sections(group, with_targets=False):
+def context_sections(group, with_targets=False, field_bytes=None):
     """Readable text, optionally carrying its exact editable storage path."""
     marker = deletion_text(group)
     if marker is not None:
@@ -1128,6 +1128,9 @@ def context_sections(group, with_targets=False):
         except (ValueError, TypeError):
             return value
     def collect(items, prefix=(), label=""):
+        def count_field(name, text):
+            if field_bytes is not None and prefix == ('items',):
+                field_bytes[name] = field_bytes.get(name, 0) + len(text.encode('utf-8'))
         reasoning = nontext = 0
         for index, item in enumerate(items):
             base = prefix + (index,)
@@ -1171,6 +1174,7 @@ def context_sections(group, with_targets=False):
                 arguments = unpack(item.get("arguments", ""))
                 if isinstance(arguments, dict) and isinstance(arguments.get("command"), str):
                     text, target = arguments["command"], base + ("arguments", "command")
+                    count_field('Command', text)
                 else:
                     text, target = (json.dumps(arguments, ensure_ascii=False, indent=2)
                                     if isinstance(arguments, dict) else str(arguments)), None
@@ -1191,6 +1195,8 @@ def context_sections(group, with_targets=False):
                 else:
                     info, text = "", str(result)
                     target = output_path if isinstance(result, str) else None
+                if target:
+                    count_field('Output', result['output'] if isinstance(result, dict) else result)
                 add(label + "Output" + (" · " + info if info else ""), text, True, target)
             else:
                 nontext += 1
@@ -1497,8 +1503,8 @@ def make_context_window(owner, read_only=False):
             n = index.siblingAtColumn(0).data(Qt.ItemDataRole.UserRole)
             row = self.window.rows[n]
             value = row['content_delta_bytes']
-            if (value <= 0 or self.maximum <= 0 or not row['context_active']
-                    or deletion_text(self.window.groups[n]) is not None):
+            sizes = row['field_bytes']
+            if not sizes and (value <= 0 or not row['context_active'] or deletion_text(self.window.groups[n])):
                 return super().paint(painter, option, index)
             opt = QStyleOptionViewItem(option)
             self.initStyleOption(opt, index)
@@ -1507,11 +1513,26 @@ def make_context_window(owner, read_only=False):
             painter.save()
             style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
             rect = opt.rect.adjusted(3, 2, -3, -2)
-            rect.setWidth(round(rect.width() * value / self.maximum))
             selected = bool(opt.state & QStyle.StateFlag.State_Selected)
             color = QColor(opt.palette.highlightedText().color() if selected else opt.palette.highlight().color())
             color.setAlpha(65)
-            painter.fillRect(rect, color)
+            if sizes:
+                middle = rect.center().x()
+                half = max(0, (rect.width() - 1) // 2)
+                painter.fillRect(middle, rect.top(), 1, rect.height(), color)
+                for field, size in sizes.items():
+                    if not size or not half:
+                        continue
+                    width = max(1, round(half * math.log2(1 + size / 128) / self.field_scale))
+                    x = middle - width if field == 'Command' else middle + 1
+                    if row['context_active'] and not self.window.groups[n].get(field.lower() + '_off'):
+                        painter.fillRect(x, rect.top(), width, rect.height(), color)
+                    else:
+                        painter.setPen(color)
+                        painter.drawRect(x, rect.top(), width - 1, rect.height() - 1)
+            else:
+                rect.setWidth(round(rect.width() * value / self.maximum))
+                painter.fillRect(rect, color)
             painter.setFont(opt.font)
             painter.setPen(opt.palette.color(QPalette.ColorRole.HighlightedText if selected else QPalette.ColorRole.Text))
             text_rect = opt.rect.adjusted(3, 0, -3, 0)
@@ -1593,7 +1614,7 @@ def make_context_window(owner, read_only=False):
             bar.addWidget(refresh); lower_layout.addLayout(bar)
             self.splitter = QSplitter(Qt.Orientation.Horizontal)
             self.tree = QTreeWidget(); self.tree.setColumnCount(7)
-            self.tree.setHeaderLabels(["✓", "Time", "API", "Type", "Content KiB", "Reasoning KiB", "Preview"])
+            self.tree.setHeaderLabels(["✓", "Time", "API", "Type", "Content KiB\nC ← | → O", "Reasoning KiB", "Preview"])
             self.tree.setRootIsDecorated(False); self.tree.setAlternatingRowColors(True)
             self.tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
             self.tree.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
@@ -1604,7 +1625,7 @@ def make_context_window(owner, read_only=False):
             for i, width in enumerate((30, 120, 55, 85, 90, 100, 202)):
                 self.tree.setColumnWidth(i, width)
             self.tree.header().setStretchLastSection(True)
-            self.input_bar_help = "Bars and size sorting exclude opaque reasoning. Content includes messages, commands, results and active images. These are serialized request bytes, not tokens. OFF/deletion rows show marker effects; rows are not additive."
+            self.input_bar_help = "Command text left, output text right. Filled = ON, outline = OFF. Width compares saved text bytes on one log scale. Other entries keep their total bar. The number and sorting use projected content KiB, including active images but not reasoning."
             self.tree.headerItem().setToolTip(4, self.input_bar_help)
             self.tree.headerItem().setToolTip(5, "Included reasoning JSON bytes, not rendered tokens. With current_turn, earlier-turn reasoning is not rendered. Saved reasoning is unchanged.")
             self.reader = QTextBrowser(); self.reader.setOpenLinks(False); self.reader.setOpenExternalLinks(False)
@@ -1658,7 +1679,6 @@ def make_context_window(owner, read_only=False):
             self.shape_mode.currentIndexChanged.connect(self.render_shape)
             self.dense_toggle.toggled.connect(self.toggle_dense)
             self.dense_toggle.setChecked(previous.get('dense', False))
-            previous = getattr(owner, '_context_place', {})
             if previous.get('id') in self.nodes and not self.nodes[previous['id']].isHidden():
                 self.tree.setCurrentItem(self.nodes[previous['id']])
                 self.tree.verticalScrollBar().setValue(previous.get('scroll', 0))
@@ -1737,11 +1757,10 @@ def make_context_window(owner, read_only=False):
                 if not block.isValid() or block.text() != prefix + ''.join(token for _, token in row):
                     targets = {}; break
                 position = block.position() + len(prefix)
-                spans = {}
                 for ident, token in row:
-                    spans.update((position + offset, ident) for offset in range(len(token)))
-                    position += len(token)
-                targets = {**spans, **targets}
+                    for _ in token:
+                        targets[position] = ident
+                        position += 1
                 block = block.previous()
             self.shape_view.targets = targets
             self.shape_view.verticalScrollBar().setValue(scroll)
@@ -1755,15 +1774,13 @@ def make_context_window(owner, read_only=False):
             current = next((g for g in state['groups'] if g['id'] == ident), None)
             if (list(self.groups) != [g['id'] for g in state['groups']]
                     or current is None or payload_bytes(current) != self.fingerprints.get(ident)
-                    or payload_bytes([state.get('memories', []), state.get('off_groups', [])]) != self.inclusion_fingerprint):
+                    or payload_bytes(state.get('off_groups', [])) != self.inclusion_fingerprint):
                 # Resolve the ID from the displayed snapshot before refreshing.
                 self.reload()
             if ident not in self.nodes:
                 self.footer.setText('That entry is no longer saved; shape refreshed.')
                 return
-            allowed = [None, {'human','human-file'}, {'request'}, {'peer'}, {'reference'}, {'gap','deletion'}, None][self.kind.currentIndex()]
-            if ((allowed is not None and self.groups[ident]['kind'] not in allowed)
-                    or (self.kind.currentIndex() == 6 and not self.groups[ident].get('marked'))):
+            if not self.matches_kind(ident):
                 self.kind.setCurrentIndex(0)
             query = self.search.text().casefold().strip()
             if query and query not in self.terms[ident] and query != str(ident):
@@ -1808,7 +1825,7 @@ def make_context_window(owner, read_only=False):
         def set_checked_active(self, active):
             ids = sorted(self.checked, key=self.positions.get)
             expected = {n: self.fingerprints[n] for n in ids}
-            return self.change_context(lambda: self.owner.set_context_active(
+            return self.change_context(ids, lambda: self.owner.set_context_active(
                 ids, active, expected=expected, expected_switches=self.inclusion_fingerprint,
                 field=self.switch_field.currentText(), push=False))
 
@@ -1817,18 +1834,21 @@ def make_context_window(owner, read_only=False):
             name, ok = QInputDialog.getText(self, "Name checked entries", "Name (leave blank to clear):",
                                             text=names.pop() if len(names) == 1 else '')
             if ok:
-                self.change_context(lambda: self.owner.name_entries(self.checked, name))
+                self.change_context(self.checked, lambda: self.owner.name_entries(self.checked, name))
 
         def mark_checked(self, marked):
-            return self.change_context(lambda: self.owner.set_marked(list(self.checked), marked))
+            return self.change_context(self.checked, lambda: self.owner.set_marked(self.checked, marked))
 
-        def change_context(self, action):
-            if self.read_only or self._deleting or not self.checked or getattr(self.owner, 'busy', False):
+        def change_context(self, ids, action):
+            if self.read_only or self._deleting or not ids or getattr(self.owner, 'busy', False):
                 return False
             self._deleting = True
             self.setEnabled(False)
             previous = self.owner.session.state
             try:
+                if previous['id'] != self.ident:
+                    raise ValueError('Session changed; reopen this view.')
+                QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
                 changed = action()
                 self.changed = self.changed or changed
                 self.last_error = None
@@ -1852,7 +1872,6 @@ def make_context_window(owner, read_only=False):
             anchor = current.data(0, Qt.ItemDataRole.UserRole) if current else None
             scroll = self.tree.verticalScrollBar().value()
             reading_scroll = self.reader.verticalScrollBar().value()
-            highlighted = {i.data(0, Qt.ItemDataRole.UserRole) for i in self.tree.selectedItems()}
             with self.owner.session.state_lock:
                 snapshot = copy.deepcopy(self.owner.session.state)
                 config = dict(self.owner.session.config)
@@ -1881,16 +1900,19 @@ def make_context_window(owner, read_only=False):
             self.positions = {g['id']: i for i, g in enumerate(groups)}
             self.rows = {r['id']: r for r in context_rows(snapshot, self.owner.session.state_path)}
             self.item_delegate.maximum = max((max(0, r['content_delta_bytes']) for r in self.rows.values()), default=0)
-            detail = {g['id']: context_sections(g, with_targets=True) for g in groups}
-            self.parts = {n: [row[:3] for row in rows] for n, rows in detail.items()}
-            self.targets = {n: [row[3] for row in rows] for n, rows in detail.items()}
+            self.parts, self.targets = {}, {}
+            largest_field = 1
+            for n, group in self.groups.items():
+                sizes = self.rows[n]['field_bytes'] = {}
+                sections = context_sections(group, with_targets=True, field_bytes=sizes)
+                self.parts[n] = [row[:3] for row in sections]
+                self.targets[n] = [row[3] for row in sections]
+                largest_field = max(largest_field, max(sizes.values(), default=0))
+            self.item_delegate.field_scale = math.log2(1 + largest_field / 128)
             self.terms = {n: (self.groups[n].get('label', '') + "\n" + "\n".join(t for _, t, _ in parts)).casefold()
                           for n, parts in self.parts.items()}
             self.checked.intersection_update(self.groups)
             self.populate(anchor, scroll)
-            for n in highlighted:
-                if n in self.nodes:
-                    self.nodes[n].setSelected(True)
             if anchor is not None and getattr(self, "current_id", None) == anchor:
                 self.reader.verticalScrollBar().setValue(reading_scroll)
 
@@ -1935,7 +1957,6 @@ def make_context_window(owner, read_only=False):
                 item.setToolTip(6, f"Group {n}\n{preview}")
                 if not r['context_active']:
                     item.setText(3, names.get(g['kind'], g['kind']) + ' OFF')
-                if not r['context_active']:
                     for column in range(7):
                         item.setForeground(column, QColor('#888888'))
                 self.tree.addTopLevelItem(item); self.nodes[n] = item
@@ -1948,14 +1969,22 @@ def make_context_window(owner, read_only=False):
                     item.setSelected(n in highlighted)
             self.tree.verticalScrollBar().setValue(scroll)
 
+        def matches_kind(self, n):
+            group = self.groups[n]
+            kind = self.kind.currentText()
+            if kind == 'All entries':
+                return True
+            if kind == 'Marked *':
+                return bool(group.get('marked'))
+            kinds = {'Human': ('human', 'human-file'), 'Runs': ('request',), 'Wire': ('peer',),
+                     'Loaded text': ('reference',), 'Deletion markers': ('gap', 'deletion')}
+            return group['kind'] in kinds[kind]
+
         def apply_filter(self):
             query = self.search.text().casefold().strip()
-            allowed = [None, {'human','human-file'}, {'request'}, {'peer'}, {'reference'}, {'gap','deletion'}, None][self.kind.currentIndex()]
             visible = []
             for n, item in self.nodes.items():
-                show = ((allowed is None or self.groups[n]['kind'] in allowed)
-                        and (self.kind.currentIndex() != 6 or self.groups[n].get('marked'))
-                        and (not query or query in self.terms[n] or query == str(n)))
+                show = (self.matches_kind(n) and (not query or query in self.terms[n] or query == str(n)))
                 item.setHidden(not show)
                 if show:
                     visible.append(item)
@@ -1985,25 +2014,29 @@ def make_context_window(owner, read_only=False):
             g, r = self.groups[n], self.rows[n]
             esc = lambda t: html.escape(str(t).encode('utf-8', 'replace').decode('utf-8'))
             query = self.search.text().strip().casefold()
-            expanded = self.expanded.setdefault(n, {i for i, (_, text, folded) in enumerate(self.parts[n])
+            expanded = self.expanded.setdefault(n, {self.targets[n][i] or i for i, (_, text, folded) in enumerate(self.parts[n])
                                                        if text and folded})
             chunks = ["<style>body{font-family:sans-serif;font-size:11pt;} pre{white-space:pre-wrap;font-family:monospace;} .body{white-space:pre-wrap;} h3{margin-bottom:6px;} a{text-decoration:none;}</style>"]
             call = context_call_number(g)
             heading = f"Group {n}" + (" *" if g.get("marked") else "") + (f" · API {call}" if call else "")
             heading += f" · Content: {r['content_delta_bytes']/1024:,.1f} KiB · Reasoning: {r['reasoning_bytes']/1024:,.1f} KiB"
             if not r['context_active']:
-                heading += " · OFF"
+                heading += " · WHOLE ENTRY OFF"
+            for field, size in r['field_bytes'].items():
+                switch = 'OFF' if g.get(field.lower() + '_off') else 'ON'
+                heading += f" · {field} switch {switch} ({size:,} B saved)"
             if g.get('label'):
                 heading += " · " + g['label']
             chunks.append(f"<p>{esc(heading)}</p>")
             for index, (title, text, folded) in enumerate(self.parts[n]):
                 editable = self.targets[n][index] is not None and not self.read_only
                 edit_link = f' <a href="edit:{index}">Edit</a>' if editable else ''
-                if g.get(title.partition(' · ')[0].lower() + '_off'):
-                    title += ' · OFF in input (saved text below)'
+                field = title.partition(' · ')[0]
+                if field in r['field_bytes'] and (not r['context_active'] or g.get(field.lower() + '_off')):
+                    title = 'Text OFF in input · ' + title
                 if not text and not editable:
                     chunks.append(f"<p><i>{esc(title)}</i></p>"); continue
-                opened = not folded or index in expanded or (bool(query) and query in text.casefold())
+                opened = not folded or (self.targets[n][index] or index) in expanded or (bool(query) and query in text.casefold())
                 if folded:
                     chunks.append(f'<h3><a href="part:{index}">{"▾" if opened else "▸"} {esc(title)}</a>{edit_link}</h3>')
                 else:
@@ -2081,48 +2114,14 @@ def make_context_window(owner, read_only=False):
                 dialog.deleteLater()
 
         def save_edit(self, index, text):
-            if self.read_only or self._deleting or getattr(self.owner, 'busy', False):
-                return False
             n = getattr(self, 'current_id', None)
-            if (n not in self.targets or not 0 <= index < len(self.targets[n])
-                    or self.targets[n][index] is None):
+            if n not in self.targets or not 0 <= index < len(self.targets[n]):
                 return False
-            if self.owner.session.state['id'] != self.ident:
-                self.last_error = 'Session changed; reopen this view.'
-                self.footer.setText(self.last_error)
+            path = self.targets[n][index]
+            if path is None:
                 return False
-            current = next((g for g in self.owner.session.state['groups'] if g['id'] == n), None)
-            if current is None or payload_bytes(current) != self.fingerprints[n]:
-                self.last_error = 'Context changed; refresh before editing.'
-                self.footer.setText(self.last_error)
-                return False
-            before = payload_bytes(current)
-            self.last_error = None
-            self._deleting = True; self.setEnabled(False)
-            self.footer.setText('Recording original and edited text…')
-            QApplication.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
-            try:
-                changed = self.owner.edit_context(n, self.targets[n][index], text,
-                                                 expected=before, push=False)
-                self.changed = self.changed or changed
-                if changed:
-                    self.reload()
-                return changed
-            except (Exception, KeyboardInterrupt) as error:
-                current = next((g for g in self.owner.session.state['groups'] if g['id'] == n), None)
-                mutated = current is None or payload_bytes(current) != before
-                self.changed = self.changed or mutated
-                self.last_error = str(error) or 'Edit interrupted.'
-                if mutated:
-                    self.last_error += ' Saved context changed; sync is still due on close.'
-                    self.reload()
-                self.footer.setText(self.last_error)
-                return False
-            finally:
-                self._deleting = False; self.setEnabled(True)
-                self.update_footer()
-                if self.last_error:
-                    self.footer.setText(self.last_error)
+            return self.change_context([n], lambda: self.owner.edit_context(
+                n, path, text, expected=self.fingerprints[n], push=False))
 
         def toggle_section(self, url):
             value = url.toString()
@@ -2134,8 +2133,9 @@ def make_context_window(owner, read_only=False):
             if n not in self.parts or not 0 <= index < len(self.parts[n]):
                 return
             opened = self.expanded.setdefault(n, set())
-            if index in opened: opened.remove(index)
-            else: opened.add(index)
+            key = self.targets[n][index] or index
+            if key in opened: opened.remove(key)
+            else: opened.add(key)
             scroll = self.reader.verticalScrollBar().value()
             self.show_entry(self.tree.currentItem())
             self.reader.verticalScrollBar().setValue(scroll)
@@ -2180,7 +2180,6 @@ def make_context_window(owner, read_only=False):
             if self.changed: message += " · saved locally; sync on close"
             self.footer.setText(message)
             self.delete_button.setText(f"Delete checked ({len(self.checked)})")
-            self.delete_button.setEnabled(bool(self.checked) and not self.read_only and not self._deleting)
             self.update_controls()
 
         def confirm_delete(self, ids):

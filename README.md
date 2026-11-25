@@ -92,6 +92,7 @@ changing inclusion. Choose **Marked \*** to find those entries. Old named
 bookmarks become independent marks on reopening, preserving their ON/OFF state.
 Without PyQt6 or a display, F6 shows a text table;
 `app.show_context(json_output=True)` returns its rows as JSON.
+Tool rows show saved command bytes on the left and output text bytes on the right. Filled means included; an outline means switched off. The reader keeps the saved text visible. Editing text does not change its switch.
 For F2 microphone transcription, install `openai` in the same environment
 and PipeWire’s `pw-record` command. The helper uses the transcription model
 configured in `tools/voice.py`.
